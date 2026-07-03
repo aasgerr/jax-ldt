@@ -26,24 +26,28 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def _warn_aggressive_dedup(before: int, after: int, tol_decimals: int, where: str) -> None:
-    """Warn if more than 10% of rows were dropped in dedup-by-rounding.
+def _warn_rounding_collapse(rows: np.ndarray, tol_decimals: int, where: str) -> None:
+    """Warn only when *rounding* collapses distinct directions.
 
-    Aggressive rounding (low ``tol_decimals``) silently collapses
-    near-duplicate hyperplane rows. When the drop rate is large, the
-    user is most likely losing distinct directions; surface a warning
-    so they can raise ``tol_decimals``.
+    The ±-parity expansion in ``symmetrize`` and the permutation
+    placement in ``build_transform_matrix`` produce exact duplicate rows
+    by design (≥50% of rows), so a raw "dropped >10% of rows" test always
+    fires and carries no signal. Instead we compare the number of
+    distinct rows at full precision against the number after rounding to
+    ``tol_decimals``: only rows that were genuinely distinct and got
+    merged *by rounding* indicate lost directions.
     """
-    if before <= 0:
+    rows = np.asarray(rows, dtype=np.float64)
+    if rows.shape[0] == 0:
         return
-    dropped = before - after
-    if dropped <= 0:
-        return
-    if dropped / before > 0.10:
+    n_full = np.unique(rows, axis=0).shape[0]
+    n_rounded = np.unique(np.round(rows, decimals=tol_decimals), axis=0).shape[0]
+    collapsed = n_full - n_rounded
+    if n_full > 0 and collapsed / n_full > 0.10:
         warnings.warn(
-            f"hyperplanes.{where}: rounded.dedup dropped {dropped} of {before} rows "
-            f"(kept {after}) at tol_decimals={tol_decimals}. "
-            f"Consider increasing tol_decimals to preserve distinct directions.",
+            f"hyperplanes.{where}: rounding to tol_decimals={tol_decimals} "
+            f"merged {collapsed} of {n_full} distinct directions "
+            f"(kept {n_rounded}). Increase tol_decimals to preserve them.",
             UserWarning,
             stacklevel=3,
         )
@@ -131,9 +135,10 @@ def symmetrize(
     LCs = LCs / first
 
     # round + unique (numpy-side for stable lex sort)
-    rounded = np.round(np.asarray(LCs), decimals=tol_decimals)
+    LCs_np = np.asarray(LCs)
+    rounded = np.round(LCs_np, decimals=tol_decimals)
     uniq = np.unique(rounded, axis=0)
-    _warn_aggressive_dedup(rounded.shape[0], uniq.shape[0], tol_decimals, "symmetrize")
+    _warn_rounding_collapse(LCs_np, tol_decimals, "symmetrize")
     return jnp.asarray(uniq, dtype=jnp.float64)
 
 
@@ -187,11 +192,15 @@ def build_transform_matrix(
     if do_symmetrize:
         LCs_arr = symmetrize(LCs_arr, tol_decimals=tol_decimals)
 
-    # Drop rows that are pure-axis-aligned (only one nonzero == 1) — those
-    # would duplicate the identity block we prepend below.
-    abs_sums = jnp.sum(jnp.abs(LCs_arr), axis=1)
-    keep = abs_sums != 1.0
-    LCs_arr = LCs_arr[keep]
+    # Drop rows that are pure-axis-aligned (exactly one nonzero entry) —
+    # those would duplicate the identity block we prepend below. The old
+    # `sum(|.|) != 1` test assumed symmetrize-normalized rows and silently
+    # discarded legitimate oblique directions whose abs-sum happened to be
+    # 1 (e.g. a user-supplied `[0.5, 0.5]` with do_symmetrize=False).
+    LCs_np_filter = np.asarray(LCs_arr)
+    n_nonzero = np.sum(np.abs(LCs_np_filter) > 1e-12, axis=1)
+    keep = n_nonzero != 1
+    LCs_arr = LCs_arr[jnp.asarray(keep)]
     n_lcs = int(LCs_arr.shape[0])
 
     if n_lcs == 0:
@@ -222,12 +231,9 @@ def build_transform_matrix(
     extra = extra / leftmost_val[:, None]
 
     # Round + unique to drop duplicates introduced by permutations.
-    extra_before = extra.shape[0]
+    _warn_rounding_collapse(extra, tol_decimals, "build_transform_matrix")
     extra = np.round(extra, decimals=tol_decimals)
     extra = np.unique(extra, axis=0)
-    _warn_aggressive_dedup(
-        extra_before, extra.shape[0], tol_decimals, "build_transform_matrix"
-    )
 
     if do_scaling:
         ranges = np.asarray(jnp.max(X, axis=0) - jnp.min(X, axis=0), dtype=np.float64)

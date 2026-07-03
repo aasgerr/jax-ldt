@@ -67,14 +67,59 @@ def test_lift_preserves_original_features(rng) -> None:
 
 
 def test_dedup_warning_fires_when_aggressive_rounding(rng) -> None:
-    """G-12: warn when aggressive rounding collapses many rows."""
+    """M12: warn only when *rounding* collapses genuinely distinct
+    directions, not on the by-design symmetry duplicates."""
     X = jnp.asarray(rng.uniform(-1.0, 1.0, size=(40, 4)))
-    # tol_decimals=1 + max_weight=3 + num_terms=3 produces many near-duplicate
-    # rows after rounding; expect the warning to fire.
-    with pytest.warns(UserWarning, match=r"rounded.*dedup"):
+    # tol_decimals=1 + max_weight=3 + num_terms=3 produces many distinct
+    # directions that only merge after coarse rounding; expect the warning.
+    with pytest.warns(UserWarning, match=r"merged .* distinct directions"):
         build_transform_matrix(
             X, num_terms=3, max_weight=3, tol_decimals=1, do_scaling=False
         )
+
+
+def test_default_hyperplane_fit_is_warning_free(rng) -> None:
+    """M12: a default HyperplaneTreeRegressor fit must not emit dedup
+    warnings — the ±-parity / permutation duplicates are by design."""
+    import warnings
+
+    from jax_ldt import HyperplaneTreeRegressor
+
+    X = rng.uniform(-1.0, 1.0, size=(120, 3))
+    y = X.sum(axis=1)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        HyperplaneTreeRegressor(
+            max_depth=3, min_samples_leaf=15, max_weight=1, num_terms=2
+        ).fit(X, y)
+    directions_warnings = [
+        w for w in caught if "distinct directions" in str(w.message)
+    ]
+    assert directions_warnings == []
+
+
+def test_do_symmetrize_false_keeps_oblique_row(rng) -> None:
+    """M13: with do_symmetrize=False a user LC like [0.5, 0.5] must
+    survive (the old abs-sum==1 filter silently dropped it)."""
+    X = jnp.asarray(rng.uniform(-1.0, 1.0, size=(20, 2)))
+    A = build_transform_matrix(
+        X, LCs=jnp.asarray([[0.5, 0.5]]), do_symmetrize=False, do_scaling=False
+    )
+    # Identity block (2 cols) plus the oblique direction => >2 columns.
+    assert A.shape[1] > 2
+    oblique = np.asarray(A[:, 2:])
+    # The extra column(s) must be proportional to (1, 1), not axis-aligned.
+    assert np.all(np.abs(oblique[0] - oblique[1]) < 1e-9)
+
+
+def test_one_hot_rows_still_dropped(rng) -> None:
+    """M13: axis-aligned rows (a single nonzero) still get dropped as
+    duplicates of the identity block."""
+    X = jnp.asarray(rng.uniform(-1.0, 1.0, size=(20, 2)))
+    A = build_transform_matrix(
+        X, LCs=jnp.asarray([[1.0, 0.0]]), do_symmetrize=False, do_scaling=False
+    )
+    assert A.shape[1] == 2  # only the identity block survives
 
 
 def test_categorical_features_excluded(rng) -> None:
