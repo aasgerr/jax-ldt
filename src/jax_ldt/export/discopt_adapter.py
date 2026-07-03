@@ -156,6 +156,7 @@ def embed_in_discopt_model(
     x_vars,
     *,
     big_m: Optional[float] = None,
+    boundary_eps: float = 0.0,
     name_prefix: str = "tree",
 ):
     """Embed a trained tree into a `discopt.Model` as a hybrid disjunction.
@@ -175,6 +176,20 @@ def embed_in_discopt_model(
                     also exposes bounds, a `big_m` too small to be a
                     valid bound raises `ValueError` rather than silently
                     producing an infeasible / wrong MIP.
+    boundary_eps  : strict-inequality margin for the right branch,
+                    default 0 (off). In memory a point with `x'_f == t`
+                    routes LEFT (`<=`), but a naive MIP encodes both
+                    branches non-strictly so the optimizer can route a
+                    boundary point either way and pick the lower-valued
+                    leaf. Setting `boundary_eps > 0` encodes the right
+                    branch as `x'_f >= t + boundary_eps`, breaking the
+                    tie toward the in-memory convention. It is OFF by
+                    default because the resulting open gap `(t, t+eps)`
+                    can make some big-M solvers report spurious
+                    infeasibility; enable it (with `eps` above your
+                    solver's feasibility tolerance) only when boundary
+                    tie-breaking matters. MIP optima within `eps` of a
+                    threshold remain inherently ambiguous.
     name_prefix   : prefix for auto-generated variables.
 
     Returns
@@ -298,7 +313,7 @@ def embed_in_discopt_model(
         # Per-side big-M: worst-case |x'_f − t| under bounds.
         if user_big_m is not None:
             if have_bounds:
-                req = max(float(ub_t[f]) - t, t - float(lb_t[f]), 0.0)
+                req = max(float(ub_t[f]) - t, t + boundary_eps - float(lb_t[f]), 0.0)
                 if user_big_m < req:
                     raise ValueError(
                         f"big_m={user_big_m} is too small: node {nid} splitting "
@@ -309,12 +324,15 @@ def embed_in_discopt_model(
             m_left = m_right = user_big_m
         else:
             m_left = float(max(ub_t[f] - t, 0.0)) + margin
-            m_right = float(max(t - lb_t[f], 0.0)) + margin
+            m_right = float(max(t + boundary_eps - lb_t[f], 0.0)) + margin
 
         sum_left = sum(z[leaf_id_to_z[lid]] for lid in left_leaves)
         sum_right = sum(z[leaf_id_to_z[lid]] for lid in right_leaves)
+        # In-memory routing sends x'_f == t LEFT; encode the right branch
+        # strictly (x'_f >= t + boundary_eps) so a boundary point can't be
+        # routed either way to game the objective.
         m.subject_to(x_t[f] - t <= m_left * (1 - sum_left))
-        m.subject_to(t - x_t[f] <= m_right * (1 - sum_right))
+        m.subject_to(t + boundary_eps - x_t[f] <= m_right * (1 - sum_right))
 
     # Output expression: y = Σ_k z_k · (β_k · x' + α_k)
     # β_k · x' + α_k where leaf_params[k, :, t] = [α_k, β_k_1, β_k_2, ...].

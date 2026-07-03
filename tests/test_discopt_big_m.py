@@ -95,6 +95,38 @@ def test_adequate_big_m_accepted() -> None:
 
 
 @pytest.mark.discopt
+def test_boundary_point_routes_left_like_predict() -> None:
+    """M1: at x'_f == t the MIP must route LEFT (matching in-memory
+    routing), not pick whichever leaf is lower. Pin x at the root
+    threshold and check the objective equals predict(threshold)."""
+    rng = np.random.default_rng(4)
+    X = rng.uniform(0.0, 10.0, size=(300, 1))
+    # Slopes chosen so the RIGHT leaf is lower at the threshold — an
+    # optimizer would prefer it absent the strict encoding.
+    y = np.where(X[:, 0] < 5.0, 10.0 - X[:, 0], -X[:, 0])
+    model = LinearTreeRegressor(max_depth=1, max_bins=8, min_samples_leaf=30).fit(X, y)
+    root_thr = float(np.asarray(model.tree_.threshold)[~np.asarray(model.tree_.is_leaf)][0])
+
+    expected = float(np.asarray(model.predict(np.array([[root_thr]])))[0])
+
+    def _solve(eps):
+        m = discopt.Model("boundary")
+        x = m.continuous("x", shape=(1,), lb=0.0, ub=10.0)
+        # boundary_eps must exceed the solver's feasibility tolerance
+        # (~1e-6) to be observable at the exact boundary.
+        y_expr = embed_in_discopt_model(model, m, x, big_m=1e4, boundary_eps=eps)
+        m.subject_to(x[0] == root_thr)
+        m.minimize(y_expr[0])
+        return float(m.solve().objective)
+
+    # With the strict margin, the boundary point routes left like predict.
+    assert abs(_solve(1e-2) - expected) < 1e-2, "boundary should route left"
+    # Without it, the optimizer routes to the lower-valued right leaf — the
+    # bug this fix addresses.
+    assert abs(_solve(0.0) - expected) > 1e-2, "eps=0 should expose the tie"
+
+
+@pytest.mark.discopt
 def test_unbounded_sentinel_triggers_fallback_warning(rng) -> None:
     """M2: discopt's ±1e20 'unbounded' sentinels are finite but toxic as
     a big-M; they must trigger the fallback warning, not become the M."""
