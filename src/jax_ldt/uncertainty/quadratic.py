@@ -12,6 +12,7 @@ which for typical sizes (n_aug ≈ 10–50, T = 1) is small.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,10 +27,12 @@ from jax_ldt.uncertainty.linprop import _resolve_tree
 
 
 def _quadratic_features(X_aug: jnp.ndarray) -> jnp.ndarray:
-    """Append cross-products X_i * X_j for i <= j to the augmented features.
+    """Cross-products X_i * X_j for i <= j (upper triangle incl. diagonal).
 
     X_aug : (N, n_aug)  -- already has the bias column at index 0
-    Returns (N, n_aug + n_aug*(n_aug+1)/2 - 1) with the all-ones column kept once.
+    Returns ``(N, n_aug*(n_aug+1)/2)``. The i=0 row of the triangle
+    reproduces the bias (index 0, == 1) and the linear terms, so the
+    linear model is a strict subspace of this feature set.
     """
     N, F = X_aug.shape
     # outer products: (N, F, F)
@@ -42,9 +45,19 @@ def _quadratic_features(X_aug: jnp.ndarray) -> jnp.ndarray:
 
 @dataclass
 class QuadraticUQState:
-    """Pre-computed quadratic params per leaf."""
+    """Pre-computed quadratic params per leaf.
+
+    ``leaf_is_fallback`` marks leaves whose quadratic refit is
+    unreliable (zero calibration points, or fewer than the number of
+    quadratic features → underdetermined). For test points routed
+    there, ``quadratic_uncertainty`` returns ``global_sigma`` (the mean
+    ``|linear - quadratic|`` over well-fit calibration points) instead of
+    the garbage ``|linear - 0|`` a zeroed refit would produce.
+    """
 
     leaf_quad_params: jnp.ndarray  # (n_nodes, n_quad_features, n_targets)
+    leaf_is_fallback: jnp.ndarray  # (n_nodes,) bool
+    global_sigma: jnp.ndarray  # (n_targets,)
 
 
 def calibrate_quadratic(
@@ -94,7 +107,54 @@ def calibrate_quadratic(
     keep = jnp.asarray(is_leaf_np[:, None, None].astype(np.float64))
     quad_params = fitted * keep
 
-    return QuadraticUQState(leaf_quad_params=quad_params)
+    # Flag leaves whose quadratic refit is unreliable: zero calibration
+    # points (→ σ would be |lin - 0| = |prediction|, pure garbage) or
+    # fewer points than quadratic features (→ underdetermined, near
+    # interpolation, |lin - quad| explodes). Such leaves fall back to a
+    # global σ at predict time.
+    counts = np.zeros(n_nodes, dtype=np.int64)
+    if leaf_ids.size > 0:
+        binc = np.bincount(leaf_ids, minlength=n_nodes)
+        counts[: binc.shape[0]] = binc
+    fallback_np = is_leaf_np & (counts < n_quad)
+
+    # Global σ = mean |lin - quad| over calibration points routed to
+    # well-fit leaves. Fall back to the mean over all points if every
+    # leaf is a fallback (tiny calibration set).
+    lin_params_cal = np.asarray(tree.leaf_params)[leaf_ids]  # (N, n_aug, T)
+    yh_lin_cal = np.einsum("nf,nft->nt", np.asarray(X_aug), lin_params_cal)
+    yh_quad_cal = np.einsum(
+        "nq,nqt->nt", np.asarray(X_quad), np.asarray(quad_params)[leaf_ids]
+    )
+    sigma_cal = np.abs(yh_lin_cal - yh_quad_cal)  # (N, T)
+    well_fit = ~fallback_np[leaf_ids] if leaf_ids.size > 0 else np.zeros(0, bool)
+    if well_fit.any():
+        global_sigma_np = sigma_cal[well_fit].mean(axis=0)
+    elif sigma_cal.shape[0] > 0:
+        global_sigma_np = sigma_cal.mean(axis=0)
+    else:
+        global_sigma_np = np.zeros(T, dtype=np.float64)
+
+    n_fallback = int(fallback_np.sum())
+    if n_fallback > 0:
+        fb_ids = np.where(fallback_np)[0]
+        preview = fb_ids[:10].tolist()
+        more = "" if fb_ids.size <= 10 else f" (+{fb_ids.size - 10} more)"
+        warnings.warn(
+            f"{n_fallback} leaves had fewer than n_quad={n_quad} calibration "
+            f"points (quadratic refit underdetermined or absent); "
+            f"quadratic_uncertainty falls back to the global mean sigma there "
+            f"(leaf ids: {preview}{more}). Provide more calibration data for "
+            "per-leaf model-form uncertainty.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    return QuadraticUQState(
+        leaf_quad_params=quad_params,
+        leaf_is_fallback=jnp.asarray(fallback_np),
+        global_sigma=jnp.asarray(global_sigma_np),
+    )
 
 
 def quadratic_uncertainty(
@@ -120,7 +180,18 @@ def quadratic_uncertainty(
     quad_params_per_sample = state.leaf_quad_params[leaf_ids]  # (N, n_quad, T)
     yh_quad = jnp.einsum("nq,nqt->nt", X_quad, quad_params_per_sample)
 
-    out = jnp.abs(yh_lin - yh_quad)
+    out = jnp.abs(yh_lin - yh_quad)  # (N, T)
+
+    # For points routed to fallback leaves (uncovered / underdetermined
+    # quadratic refit), substitute the global sigma instead of the
+    # garbage |lin - 0| the zeroed refit would give.
+    is_fallback = state.leaf_is_fallback[leaf_ids]  # (N,)
+    out = jnp.where(
+        is_fallback[:, None],
+        jnp.broadcast_to(state.global_sigma, out.shape),
+        out,
+    )
+
     if tree.n_targets == 1:
         out = out[:, 0]
     return out
