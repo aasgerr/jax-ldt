@@ -676,27 +676,38 @@ def _route_one(tree: Tree, x_t: jnp.ndarray) -> jnp.ndarray:
     return final_id
 
 
+@jax.jit
+def _predict_jit(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
+    """JIT'd core prediction returning (N, T). `Tree` is a registered
+    pytree (its shape metadata is static aux), so this traces once per
+    fitted tree and reuses the compiled kernel across same-shape calls —
+    the many-small-calls pattern in acquisition/AL loops in particular."""
+    X_t = X @ tree.transform_matrix
+    X_aug = add_bias(X_t)
+    leaf_ids = jax.vmap(lambda x: _route_one(tree, x))(X_t)  # (N,)
+    params_per_sample = tree.leaf_params[leaf_ids]  # (N, n_aug, T)
+    return jnp.einsum("nf,nft->nt", X_aug, params_per_sample)
+
+
 def predict(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
     """Predict for X (N, n_features_in). Returns (N,) or (N, T)."""
     X = jnp.asarray(X, dtype=jnp.float64)
-    X_t = X @ tree.transform_matrix
-    X_aug = add_bias(X_t)
-
-    leaf_ids = jax.vmap(lambda x: _route_one(tree, x))(X_t)  # (N,)
-    # Gather leaf params per sample: (N, n_aug, T)
-    params_per_sample = tree.leaf_params[leaf_ids]
-    # einsum to multiply
-    yh = jnp.einsum("nf,nft->nt", X_aug, params_per_sample)
+    yh = _predict_jit(tree, X)
     if tree.n_targets == 1:
         yh = yh[:, 0]
     return yh
 
 
+@jax.jit
+def _apply_jit(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
+    X_t = X @ tree.transform_matrix
+    return jax.vmap(lambda x: _route_one(tree, x))(X_t)
+
+
 def apply_tree(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
     """Return leaf node id for each input row."""
     X = jnp.asarray(X, dtype=jnp.float64)
-    X_t = X @ tree.transform_matrix
-    return jax.vmap(lambda x: _route_one(tree, x))(X_t)
+    return _apply_jit(tree, X)
 
 
 # Backwards-compatible alias for the previous private name.
