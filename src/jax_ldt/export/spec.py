@@ -52,19 +52,22 @@ def _np(x: Any) -> Any:
 
 
 def _none_for_nan(arr: np.ndarray) -> Any:
-    """Recursively convert an n-D float array to a nested list, with
-    every NaN replaced by ``None``.
+    """Convert an n-D float array to a nested list, NaN → ``None``.
 
     Plain ``arr.tolist()`` produces Python ``float('nan')`` values which
     Python's ``json`` module renders as the literal ``NaN`` — invalid by
     the JSON spec and rejected by strict parsers (e.g., ``json.loads`` in
     other languages, ``allow_nan=False`` round-trips). Encoding NaN as
     ``null`` keeps the payload spec-compliant.
+
+    Vectorised: build a Python-object array, null the NaN cells in one
+    masked assignment, and ``tolist()`` — instead of an element-by-element
+    Python recursion over every scalar (O(size) interpreter calls).
     """
-    arr = np.asarray(arr)
-    if arr.ndim == 0:
-        return None if (arr.dtype.kind == "f" and np.isnan(arr)) else arr.item()
-    return [_none_for_nan(sub) for sub in arr]
+    arr = np.asarray(arr, dtype=np.float64)
+    obj = arr.astype(object)
+    obj[np.isnan(arr)] = None
+    return obj.tolist()
 
 
 def tree_to_dict(tree: Tree, *, kind: str = "tree") -> dict[str, Any]:
@@ -95,7 +98,7 @@ def tree_to_dict(tree: Tree, *, kind: str = "tree") -> dict[str, Any]:
         "n_features_in": int(tree.n_features_in),
         "n_features_transformed": int(tree.n_features_transformed),
         "n_targets": int(tree.n_targets),
-        "transform_matrix": _np(np.asarray(tree.transform_matrix)),
+        "transform_matrix": _none_for_nan(np.asarray(tree.transform_matrix)),
         "categorical_features": list(tree.categorical_features),
         "linear_features": list(tree.linear_features),
         "tree": {
@@ -113,22 +116,21 @@ def tree_to_dict(tree: Tree, *, kind: str = "tree") -> dict[str, Any]:
         out["uq"] = {
             "method": "linprop",
             "leaf_n": [int(v) for v in np.asarray(tree.leaf_uq.n).tolist()],
-            "leaf_x_mean": _np(np.asarray(tree.leaf_uq.x_mean)),
-            "leaf_x_var": _np(np.asarray(tree.leaf_uq.x_var)),
-            "leaf_mse": _np(np.asarray(tree.leaf_uq.mse)),
+            "leaf_x_mean": _none_for_nan(np.asarray(tree.leaf_uq.x_mean)),
+            "leaf_x_var": _none_for_nan(np.asarray(tree.leaf_uq.x_var)),
+            "leaf_mse": _none_for_nan(np.asarray(tree.leaf_uq.mse)),
         }
     return out
 
 
 def _nan_for_none_array(nested: Any) -> np.ndarray:
     """Inverse of :func:`_none_for_nan`: build a float array where ``None``
-    entries become ``NaN``. Accepts arbitrary nesting depth."""
-    arr = np.array(nested, dtype=object)
-    out = np.empty(arr.shape, dtype=np.float64)
-    for idx in np.ndindex(arr.shape):
-        v = arr[idx]
-        out[idx] = float("nan") if v is None else float(v)
-    return out
+    entries become ``NaN``. Accepts arbitrary nesting depth.
+
+    Vectorised: ``np.array(nested, dtype=float)`` maps ``None`` → ``NaN``
+    natively, replacing the per-scalar ``np.ndindex`` loop.
+    """
+    return np.array(nested, dtype=np.float64)
 
 
 def tree_from_dict(d: dict[str, Any]) -> Tree:
@@ -146,9 +148,9 @@ def tree_from_dict(d: dict[str, Any]) -> Tree:
         u = d["uq"]
         leaf_uq = LeafUQ(
             n=jnp.asarray(u["leaf_n"], dtype=jnp.int32),
-            x_mean=jnp.asarray(u["leaf_x_mean"], dtype=jnp.float64),
-            x_var=jnp.asarray(u["leaf_x_var"], dtype=jnp.float64),
-            mse=jnp.asarray(u["leaf_mse"], dtype=jnp.float64),
+            x_mean=jnp.asarray(_nan_for_none_array(u["leaf_x_mean"]), dtype=jnp.float64),
+            x_var=jnp.asarray(_nan_for_none_array(u["leaf_x_var"]), dtype=jnp.float64),
+            mse=jnp.asarray(_nan_for_none_array(u["leaf_mse"]), dtype=jnp.float64),
         )
 
     return Tree(
@@ -158,7 +160,9 @@ def tree_from_dict(d: dict[str, Any]) -> Tree:
         left=jnp.asarray(t["left"], dtype=jnp.int32),
         right=jnp.asarray(t["right"], dtype=jnp.int32),
         leaf_params=jnp.asarray(leaf_params, dtype=jnp.float64),
-        transform_matrix=jnp.asarray(d["transform_matrix"], dtype=jnp.float64),
+        transform_matrix=jnp.asarray(
+            _nan_for_none_array(d["transform_matrix"]), dtype=jnp.float64
+        ),
         leaf_uq=leaf_uq,
         n_features_in=int(d["n_features_in"]),
         n_features_transformed=int(d["n_features_transformed"]),
@@ -222,7 +226,10 @@ def to_json(
     if kind is None:
         kind = _infer_kind(model_or_tree)
     payload = tree_to_dict(tree, kind=kind)
-    s = json.dumps(payload, indent=2)
+    # allow_nan=False turns any stray NaN/inf that slipped past the
+    # NaN→null encoding into a loud ValueError instead of emitting the
+    # invalid literal `NaN`/`Infinity`.
+    s = json.dumps(payload, indent=2, allow_nan=False)
     if path is not None:
         Path(path).write_text(s)
     return s

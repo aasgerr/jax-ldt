@@ -57,11 +57,15 @@ def _maybe_warn_non_float64(arr, name: str) -> None:
 def _all_finite(arr) -> bool:
     """Return True iff every element of ``arr`` is finite.
 
-    Uses numpy on a host view to avoid a per-fit device→host scalar
-    transfer (`bool(jnp.all(...))`) which is brutal under cross-validation
-    or active-learning loops.
+    For a numpy input we reduce on host directly. For a JAX array we
+    reduce *on device* and transfer only the resulting scalar bool —
+    ``np.asarray(arr)`` would instead copy the whole array to host, an
+    O(n) device→host transfer per fit/predict that is costly on GPU/TPU
+    under cross-validation or active-learning loops.
     """
-    return bool(np.isfinite(np.asarray(arr)).all())
+    if isinstance(arr, np.ndarray):
+        return bool(np.isfinite(arr).all())
+    return bool(jnp.isfinite(arr).all())
 
 
 def _validate_fit_inputs(X: jnp.ndarray, y: jnp.ndarray) -> None:
