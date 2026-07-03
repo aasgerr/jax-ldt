@@ -192,15 +192,17 @@ def _evaluate_splits_kernel(
     yh_above = jnp.einsum("nf,ift->int", X_aug, theta_above_flat)
 
     weighted_loss = _weighted_loss(loss_name)
-    loss_below_flat = jax.vmap(lambda yh, w: weighted_loss(y, yh, w))(yh_below, mb_flat)
-    loss_above_flat = jax.vmap(lambda yh, w: weighted_loss(y, yh, w))(yh_above, ma_flat)
-
-    n_total = jnp.sum(node_mask)
-    safe_n_total = jnp.where(n_total > 0.0, n_total, 1.0)
-    overall_flat = (
-        loss_below_flat * n_below.reshape(K * B, 1)
-        + loss_above_flat * n_above.reshape(K * B, 1)
-    ) / safe_n_total
+    # Evaluate the loss of the *combined* piecewise prediction over the
+    # whole node (upstream convention, `_classes.py` overall_error). A
+    # row takes its own side's prediction; rows outside the node get 0
+    # and are excluded by the `node_mask` weights. This is
+    # criterion-correct for every loss: for mean-type losses (mae, msle)
+    # it reduces exactly to the sample-count-weighted average of the two
+    # sides, but for rmse it pools correctly under the sqrt and for
+    # max_abs it takes the max across sides — a per-side weighted average
+    # understates both and picks the wrong split.
+    yh_combined = yh_below * mb_flat[:, :, None] + yh_above * ma_flat[:, :, None]
+    overall_flat = jax.vmap(lambda yh: weighted_loss(y, yh, node_mask))(yh_combined)
     overall_flat = jnp.sum(overall_flat, axis=-1)  # sum over targets
     overall_flat = jnp.where(valid.reshape(K * B), overall_flat, jnp.inf)
     overall_flat = jnp.nan_to_num(overall_flat, nan=jnp.inf, posinf=jnp.inf)
