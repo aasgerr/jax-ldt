@@ -96,6 +96,9 @@ class ConformalCalibrator:
         self._sparse_leaves: tuple[int, ...] = ()
 
     def calibrate(self, model: _FittedTreeLike, X_cal: jnp.ndarray, y_cal: jnp.ndarray) -> "ConformalCalibrator":
+        from jax_ldt._validation import _require_x64
+
+        _require_x64()
         if model.tree_ is None:
             raise RuntimeError("Model must be fitted before calibration.")
         tree = model.tree_

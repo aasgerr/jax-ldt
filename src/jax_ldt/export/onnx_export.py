@@ -52,6 +52,9 @@ def to_onnx(
     -------
     onnx.ModelProto
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     onnx, TensorProto, helper, numpy_helper = _import_onnx()
 
     if isinstance(model_or_tree, Tree):

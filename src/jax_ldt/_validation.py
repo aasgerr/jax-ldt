@@ -8,8 +8,31 @@ from __future__ import annotations
 
 import warnings
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+def _require_x64() -> None:
+    """Fail fast if JAX 64-bit mode is disabled.
+
+    jax-ldt fits leaf models via the ridge normal equations, which
+    square the condition number of ``X``. In float32 this silently
+    produces wrong (or NaN) leaf fits on badly scaled data, and JAX's
+    default config demotes float64 inputs to float32. Rather than
+    degrade precision behind the user's back, we require x64 at every
+    public entry point and refuse to run otherwise.
+    """
+    if not jax.config.jax_enable_x64:
+        raise RuntimeError(
+            "jax-ldt requires JAX 64-bit mode, which is currently disabled. "
+            "Enable it BEFORE importing jax (and jax_ldt), e.g.:\n"
+            '    import os; os.environ["JAX_ENABLE_X64"] = "1"\n'
+            "or, if jax is already imported:\n"
+            '    import jax; jax.config.update("jax_enable_x64", True)\n'
+            "Without x64, float64 inputs are silently demoted to float32 and "
+            "the ridge solver loses precision on badly scaled data."
+        )
 
 
 def _maybe_warn_non_float64(arr, name: str) -> None:
@@ -42,6 +65,7 @@ def _all_finite(arr) -> bool:
 
 
 def _validate_fit_inputs(X: jnp.ndarray, y: jnp.ndarray) -> None:
+    _require_x64()
     if X.ndim != 2:
         raise ValueError(f"X must be 2-D (n_samples, n_features); got shape {tuple(X.shape)}")
     if X.shape[0] == 0:
@@ -61,6 +85,7 @@ def _validate_fit_inputs(X: jnp.ndarray, y: jnp.ndarray) -> None:
 
 
 def _validate_predict_input(X: jnp.ndarray, n_features_in: int) -> None:
+    _require_x64()
     if X.ndim != 2:
         raise ValueError(f"X must be 2-D; got shape {tuple(X.shape)}")
     if X.shape[1] != n_features_in:

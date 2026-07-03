@@ -177,6 +177,9 @@ def embed_in_discopt_model(
     y_expr : list of `discopt.Expression`, one per output target.
              For the common single-target case, you can use `y_expr[0]`.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     discopt = _check_discopt()
 
     if isinstance(model_or_tree, Tree):

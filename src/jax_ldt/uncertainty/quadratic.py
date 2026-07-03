@@ -135,6 +135,9 @@ class QuadraticUQ:
         self._tree: Optional[Tree] = None
 
     def calibrate(self, model_or_tree, X: jnp.ndarray, y: jnp.ndarray) -> "QuadraticUQ":
+        from jax_ldt._validation import _require_x64
+
+        _require_x64()
         self._tree = _resolve_tree(model_or_tree)
         self.state_ = calibrate_quadratic(self._tree, X, y, ridge=self.ridge)
         return self
