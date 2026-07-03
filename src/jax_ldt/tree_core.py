@@ -385,6 +385,22 @@ def grow_tree(
     if split_features is None:
         split_features = tuple(i for i in range(n_transformed) if i not in categorical_features)
 
+    # Restrict the leaf/split regressions to `linear_features` (+ bias).
+    # Columns outside the set are zeroed in the *fitting* design matrix
+    # `X_fit`; with a zeroed column, `XᵀWX` carries only `ridge` on that
+    # diagonal and `Xᵀy = 0`, so the solved coefficient is exactly 0.
+    # `X_aug` (all columns) is still used for prediction/UQ downstream,
+    # where those zero coefficients are inert — so `leaf_params` keeps
+    # its `(n_aug, T)` shape and predict/ONNX/JSON/discopt are unchanged.
+    # This is what makes `linear_features` (and, by default, categorical
+    # exclusion) actually affect the leaf models. Routing still uses the
+    # raw `X_t` columns, so `split_features` is unaffected.
+    lin_cols = np.zeros(n_aug, dtype=bool)
+    lin_cols[0] = True  # bias term always retained
+    for f in linear_features:
+        lin_cols[int(f) + 1] = True
+    X_fit = X_aug * jnp.asarray(lin_cols, dtype=X_aug.dtype)[None, :]
+
     # Resolve min_samples_leaf to absolute integer.
     if isinstance(min_samples_leaf, float) and 0.0 < min_samples_leaf < 1.0:
         msl = max(3, int(jnp.ceil(min_samples_leaf * N)))
@@ -415,7 +431,7 @@ def grow_tree(
 
     # --- root node ---
     root_mask = jnp.ones(N, dtype=X_aug.dtype)
-    root_params, root_loss = _initial_leaf(X_aug, y, root_mask, ridge, criterion)
+    root_params, root_loss = _initial_leaf(X_fit, y, root_mask, ridge, criterion)
 
     # node bookkeeping
     nodes: list[_GrowNode] = []
@@ -495,7 +511,7 @@ def grow_tree(
             or n_active < mss
             or n_active < 2 * msl
         ):
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
@@ -506,13 +522,13 @@ def grow_tree(
         X_split_subdomain = X_t_np[np.ix_(active_idx, split_features)]
         thresholds = _compute_thresholds(X_split_subdomain, max_bins)
         if thresholds.shape[0] == 0:
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
         X_split = X_t[:, split_feats_arr]
         overall, theta_b, theta_a, n_below, n_above = _evaluate_splits(
-            X_aug,
+            X_fit,
             y,
             mask,
             X_split,
@@ -527,7 +543,7 @@ def grow_tree(
         # trigger a separate transfer per access.
         overall_np = np.asarray(overall)
         if not np.isfinite(overall_np).any():
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
@@ -541,7 +557,7 @@ def grow_tree(
         # non-negative improvement is accepted"; positive values prune.
         impurity_decrease = node_loss[node_id] - best_loss
         if impurity_decrease < min_impurity_decrease:
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 

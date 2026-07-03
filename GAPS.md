@@ -219,7 +219,16 @@ intervening work and are kept here for historical reference.
   is called at every public `fit` / `predict` / `calibrate` boundary.
 - **G-17.** HT/LMDT parameter symmetry — `HyperplaneTreeRegressor`
   now exposes `linear_features` and `split_features`, threaded through
-  to `grow_tree`.
+  to `grow_tree`. **Note (2026-07):** `split_features` was applied, but
+  `linear_features` was only stored in `Tree` metadata and never used
+  by the leaf fits — see H1 below. Now fully applied.
+- **H1/H2 (2026-07).** `linear_features` is now enforced: `grow_tree`
+  zeroes excluded columns in the fitting design matrix so their leaf
+  coefficients are exactly 0 (`leaf_params` shape unchanged, so
+  predict/ONNX/JSON/discopt are unaffected). Categorical features,
+  which are excluded from the default `linear_features`, therefore no
+  longer receive leaf-model coefficients — matching the documented
+  contract. Pinned by `tests/test_linear_features.py`.
 - **G-18.** `MaxVariance` — has a real `score` method (no longer an
   empty dataclass), even if the implementation is short.
 - **G-19 (planned files).** `viz.py`, `sklearn_compat.py`,
