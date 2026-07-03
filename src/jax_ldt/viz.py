@@ -100,9 +100,12 @@ def plot_calibration(
         lo, hi = intervals
         lo = np.asarray(lo).reshape(-1)
         hi = np.asarray(hi).reshape(-1)
-        order = np.argsort(y_pred)
+        # Points are plotted at x=y_true; the band must share that x-axis
+        # so it actually brackets them. Ordering/filling by y_pred (the
+        # y-axis) offset the band horizontally from the points it covers.
+        order = np.argsort(y_true)
         ax.fill_between(
-            y_pred[order],
+            y_true[order],
             lo[order],
             hi[order],
             alpha=0.2,
