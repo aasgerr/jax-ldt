@@ -52,6 +52,15 @@ def to_onnx(
     -------
     onnx.ModelProto
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
+    if opset < 13:
+        raise ValueError(
+            f"to_onnx requires opset >= 13 (got {opset}); the graph uses the "
+            "axes-as-input form of Squeeze/Unsqueeze and LessOrEqual, which "
+            "need opset 13+."
+        )
     onnx, TensorProto, helper, numpy_helper = _import_onnx()
 
     if isinstance(model_or_tree, Tree):
@@ -244,12 +253,16 @@ def to_onnx(
     )
 
     opset_imports = [helper.make_opsetid("", opset)]
-    # Let `helper.make_model` derive a compatible ir_version from the
-    # opset rather than hardcoding one. Older code pinned ``ir_version=8``,
-    # which produced checker warnings on newer onnx releases (where opset
-    # 18 expects ir_version ≥ 9). With no override, the helper picks the
-    # minimum ir_version the requested opset is valid against.
     model = helper.make_model(graph, opset_imports=opset_imports)
+    # `make_model` sets ir_version = onnx.IR_VERSION (the newest the
+    # installed onnx library knows), which can exceed what an older
+    # onnxruntime accepts even though every op is plain opset-<=18. Pin
+    # the *minimum* ir_version the opset is valid against so exported
+    # models load on the widest range of runtimes.
+    try:
+        model.ir_version = helper.find_min_ir_version_for(opset_imports)
+    except Exception:  # pragma: no cover - defensive; keep default if helper missing
+        pass
     model.producer_name = "jax-ldt"
     onnx.checker.check_model(model)
 

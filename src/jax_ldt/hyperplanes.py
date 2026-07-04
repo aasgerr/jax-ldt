@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-import math
 import warnings
 from typing import Optional
 
@@ -26,24 +25,28 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def _warn_aggressive_dedup(before: int, after: int, tol_decimals: int, where: str) -> None:
-    """Warn if more than 10% of rows were dropped in dedup-by-rounding.
+def _warn_rounding_collapse(rows: np.ndarray, tol_decimals: int, where: str) -> None:
+    """Warn only when *rounding* collapses distinct directions.
 
-    Aggressive rounding (low ``tol_decimals``) silently collapses
-    near-duplicate hyperplane rows. When the drop rate is large, the
-    user is most likely losing distinct directions; surface a warning
-    so they can raise ``tol_decimals``.
+    The ±-parity expansion in ``symmetrize`` and the permutation
+    placement in ``build_transform_matrix`` produce exact duplicate rows
+    by design (≥50% of rows), so a raw "dropped >10% of rows" test always
+    fires and carries no signal. Instead we compare the number of
+    distinct rows at full precision against the number after rounding to
+    ``tol_decimals``: only rows that were genuinely distinct and got
+    merged *by rounding* indicate lost directions.
     """
-    if before <= 0:
+    rows = np.asarray(rows, dtype=np.float64)
+    if rows.shape[0] == 0:
         return
-    dropped = before - after
-    if dropped <= 0:
-        return
-    if dropped / before > 0.10:
+    n_full = np.unique(rows, axis=0).shape[0]
+    n_rounded = np.unique(np.round(rows, decimals=tol_decimals), axis=0).shape[0]
+    collapsed = n_full - n_rounded
+    if n_full > 0 and collapsed / n_full > 0.10:
         warnings.warn(
-            f"hyperplanes.{where}: rounded.dedup dropped {dropped} of {before} rows "
-            f"(kept {after}) at tol_decimals={tol_decimals}. "
-            f"Consider increasing tol_decimals to preserve distinct directions.",
+            f"hyperplanes.{where}: rounding to tol_decimals={tol_decimals} "
+            f"merged {collapsed} of {n_full} distinct directions "
+            f"(kept {n_rounded}). Increase tol_decimals to preserve them.",
             UserWarning,
             stacklevel=3,
         )
@@ -131,14 +134,11 @@ def symmetrize(
     LCs = LCs / first
 
     # round + unique (numpy-side for stable lex sort)
-    rounded = np.round(np.asarray(LCs), decimals=tol_decimals)
+    LCs_np = np.asarray(LCs)
+    rounded = np.round(LCs_np, decimals=tol_decimals)
     uniq = np.unique(rounded, axis=0)
-    _warn_aggressive_dedup(rounded.shape[0], uniq.shape[0], tol_decimals, "symmetrize")
+    _warn_rounding_collapse(LCs_np, tol_decimals, "symmetrize")
     return jnp.asarray(uniq, dtype=jnp.float64)
-
-
-def _factorial(n: int) -> int:
-    return math.factorial(n)
 
 
 def build_transform_matrix(
@@ -167,9 +167,17 @@ def build_transform_matrix(
     X = jnp.asarray(X)
     n_cols = int(X.shape[1])
 
+    if num_terms < 1:
+        raise ValueError(f"num_terms must be >= 1; got {num_terms}")
+
     if categorical_features is None:
         categorical_features = ()
     cat_set = set(categorical_features)
+    bad_cat = sorted(c for c in cat_set if c < 0 or c >= n_cols)
+    if bad_cat:
+        raise ValueError(
+            f"categorical_features out of range for {n_cols}-feature X: {bad_cat}"
+        )
     cols_to_perm = tuple(c for c in range(n_cols) if c not in cat_set)
     n_non_cat = len(cols_to_perm)
 
@@ -183,15 +191,35 @@ def build_transform_matrix(
         LCs_arr = jnp.asarray(rows, dtype=jnp.float64)
     else:
         LCs_arr = jnp.asarray(LCs, dtype=jnp.float64)
+        if LCs_arr.ndim != 2 or LCs_arr.shape[1] != num_terms:
+            raise ValueError(
+                f"hyperplane_weights/LCs must have shape (n_rows, num_terms="
+                f"{num_terms}); got {tuple(LCs_arr.shape)}. Set num_terms to the "
+                "LC width."
+            )
 
     if do_symmetrize:
         LCs_arr = symmetrize(LCs_arr, tol_decimals=tol_decimals)
 
-    # Drop rows that are pure-axis-aligned (only one nonzero == 1) — those
-    # would duplicate the identity block we prepend below.
-    abs_sums = jnp.sum(jnp.abs(LCs_arr), axis=1)
-    keep = abs_sums != 1.0
-    LCs_arr = LCs_arr[keep]
+    # Drop rows that are pure-axis-aligned (exactly one nonzero entry) —
+    # those would duplicate the identity block we prepend below. The old
+    # `sum(|.|) != 1` test assumed symmetrize-normalized rows and silently
+    # discarded legitimate oblique directions whose abs-sum happened to be
+    # 1 (e.g. a user-supplied `[0.5, 0.5]` with do_symmetrize=False).
+    LCs_np_filter = np.asarray(LCs_arr)
+    n_nonzero = np.sum(np.abs(LCs_np_filter) > 1e-12, axis=1)
+    n_all_zero = int(np.sum(n_nonzero == 0))
+    if n_all_zero > 0:
+        warnings.warn(
+            f"build_transform_matrix: dropped {n_all_zero} all-zero LC row(s) "
+            "(a constant-zero lifted feature carries no split information).",
+            UserWarning,
+            stacklevel=2,
+        )
+    # Keep only genuine oblique rows: >1 nonzero entry. Rows with exactly
+    # one nonzero duplicate the identity block; all-zero rows are dead.
+    keep = n_nonzero > 1
+    LCs_arr = LCs_arr[jnp.asarray(keep)]
     n_lcs = int(LCs_arr.shape[0])
 
     if n_lcs == 0:
@@ -222,12 +250,9 @@ def build_transform_matrix(
     extra = extra / leftmost_val[:, None]
 
     # Round + unique to drop duplicates introduced by permutations.
-    extra_before = extra.shape[0]
+    _warn_rounding_collapse(extra, tol_decimals, "build_transform_matrix")
     extra = np.round(extra, decimals=tol_decimals)
     extra = np.unique(extra, axis=0)
-    _warn_aggressive_dedup(
-        extra_before, extra.shape[0], tol_decimals, "build_transform_matrix"
-    )
 
     if do_scaling:
         ranges = np.asarray(jnp.max(X, axis=0) - jnp.min(X, axis=0), dtype=np.float64)

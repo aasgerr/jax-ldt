@@ -112,6 +112,9 @@ class LinearTreeRegressor:
         y = y.astype(jnp.float64)
         self.n_features_in_ = int(X.shape[1])
         self.n_targets_ = 1 if y.ndim == 1 else int(y.shape[1])
+        # Remember 2-D single-target y so predict mirrors the training
+        # shape (sklearn convention): (N, 1) in → (N, 1) out.
+        self._y_2d = bool(y.ndim == 2)
         self.tree_ = tree_core.grow_tree(
             X,
             y,
@@ -136,7 +139,10 @@ class LinearTreeRegressor:
         X = jnp.asarray(X, dtype=jnp.float64)
         from jax_ldt._validation import _validate_predict_input
         _validate_predict_input(X, self.n_features_in_)
-        return tree_core.predict(self.tree_, X)
+        yh = tree_core.predict(self.tree_, X)
+        if self.n_targets_ == 1 and getattr(self, "_y_2d", False):
+            yh = yh.reshape(-1, 1)
+        return yh
 
     def apply(self, X: ArrayLike) -> jnp.ndarray:
         if self.tree_ is None:

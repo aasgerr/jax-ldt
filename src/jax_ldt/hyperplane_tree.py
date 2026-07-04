@@ -135,6 +135,7 @@ class HyperplaneTreeRegressor:
         y = y.astype(jnp.float64)
         self.n_features_in_ = int(X.shape[1])
         self.n_targets_ = 1 if y.ndim == 1 else int(y.shape[1])
+        self._y_2d = bool(y.ndim == 2)
 
         A = build_transform_matrix(
             X,
@@ -171,7 +172,10 @@ class HyperplaneTreeRegressor:
         X = jnp.asarray(X, dtype=jnp.float64)
         from jax_ldt._validation import _validate_predict_input
         _validate_predict_input(X, self.n_features_in_)
-        return tree_core.predict(self.tree_, X)
+        yh = tree_core.predict(self.tree_, X)
+        if self.n_targets_ == 1 and getattr(self, "_y_2d", False):
+            yh = yh.reshape(-1, 1)
+        return yh
 
     def apply(self, X: ArrayLike) -> jnp.ndarray:
         if self.tree_ is None:

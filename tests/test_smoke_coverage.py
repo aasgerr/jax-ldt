@@ -73,7 +73,13 @@ def test_embed_ht_in_discopt_model(rng) -> None:
 
     m = discopt.Model("ht-embed")
     x = m.continuous("x", shape=(2,), lb=-1.5, ub=1.5)
-    y_expr = embed_in_discopt_model(model, m, x, big_m=20.0)
+    # discopt's big-M MIP solver is numerically fragile: feasibility on
+    # this lifted-feature model is non-monotonic in big_m (20/100 report
+    # spurious infeasibility, 50 solves cleanly). big_m is a genuine big-M
+    # constant here (see embed_in_discopt_model); 50 is comfortably above
+    # the required routing/output bounds for this box while staying in a
+    # solver-friendly regime.
+    y_expr = embed_in_discopt_model(model, m, x, big_m=50.0)
     m.minimize(y_expr[0])
     result = m.solve()
     obj = float(result.objective)

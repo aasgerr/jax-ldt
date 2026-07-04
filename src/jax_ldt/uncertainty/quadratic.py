@@ -12,6 +12,7 @@ which for typical sizes (n_aug ≈ 10–50, T = 1) is small.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,25 +27,38 @@ from jax_ldt.uncertainty.linprop import _resolve_tree
 
 
 def _quadratic_features(X_aug: jnp.ndarray) -> jnp.ndarray:
-    """Append cross-products X_i * X_j for i <= j to the augmented features.
+    """Cross-products X_i * X_j for i <= j (upper triangle incl. diagonal).
 
     X_aug : (N, n_aug)  -- already has the bias column at index 0
-    Returns (N, n_aug + n_aug*(n_aug+1)/2 - 1) with the all-ones column kept once.
+    Returns ``(N, n_aug*(n_aug+1)/2)``. The i=0 row of the triangle
+    reproduces the bias (index 0, == 1) and the linear terms, so the
+    linear model is a strict subspace of this feature set.
     """
     N, F = X_aug.shape
-    # outer products: (N, F, F)
-    outer = X_aug[:, :, None] * X_aug[:, None, :]
-    # take the upper triangle (including diagonal). Skip [0,0] since it's just 1.
+    # Upper-triangle (incl. diagonal) cross-products, formed directly as
+    # X[:, i] * X[:, j] for i <= j — avoids materialising the full
+    # (N, F, F) outer product just to gather half of it.
     iu, ju = jnp.triu_indices(F)
-    cross = outer[:, iu, ju]  # (N, F*(F+1)/2)
-    return cross  # already includes the bias-squared term at index 0 (== 1)
+    return X_aug[:, iu] * X_aug[:, ju]  # (N, F*(F+1)/2)
 
 
 @dataclass
 class QuadraticUQState:
-    """Pre-computed quadratic params per leaf."""
+    """Pre-computed quadratic params per leaf.
+
+    ``leaf_is_fallback`` marks leaves that received ZERO calibration
+    points (their quad params are exactly 0, so a per-leaf σ would be the
+    garbage ``|linear - 0| = |prediction|``). For test points routed
+    there, ``quadratic_uncertainty`` returns ``global_sigma`` (the mean
+    ``|linear - quadratic|`` over non-empty calibration leaves) instead.
+    Leaves with few (< n_quad) points are underdetermined but keep their
+    per-leaf estimate — with the ridge prior it stays a reasonable,
+    non-exploding signal for realistic leaf sizes; it is simply noisier.
+    """
 
     leaf_quad_params: jnp.ndarray  # (n_nodes, n_quad_features, n_targets)
+    leaf_is_fallback: jnp.ndarray  # (n_nodes,) bool
+    global_sigma: jnp.ndarray  # (n_targets,)
 
 
 def calibrate_quadratic(
@@ -57,6 +71,9 @@ def calibrate_quadratic(
 
     Accepts either a fitted regressor or a `Tree` pytree.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     tree = _resolve_tree(model_or_tree)
     X = jnp.asarray(X, dtype=jnp.float64)
     y = jnp.asarray(y, dtype=jnp.float64)
@@ -80,21 +97,71 @@ def calibrate_quadratic(
     # zero-init invariant that downstream code relies on).
     is_leaf_np = np.asarray(tree.is_leaf)
     leaf_node_ids = np.where(is_leaf_np)[0]
-    masks_np = np.zeros((n_nodes, X_quad.shape[0]), dtype=np.float64)
+
+    # Fit ONLY the leaves. The previous version built a dense (n_nodes, N)
+    # mask and vmapped the ridge fit over every node — half the solves
+    # (internal nodes) were pure waste that got zeroed afterward, and the
+    # mask doubled the memory. We fit the (n_leaves, N) membership masks
+    # and scatter the results back into the (n_nodes, ...) array, leaving
+    # internal nodes at zero (the contract downstream relies on).
+    quad_params = jnp.zeros((n_nodes, n_quad, T), dtype=jnp.float64)
     if leaf_node_ids.size > 0:
         membership = (leaf_ids[None, :] == leaf_node_ids[:, None]).astype(np.float64)
-        masks_np[leaf_node_ids] = membership
-    masks = jnp.asarray(masks_np)
+        leaf_masks = jnp.asarray(membership)  # (n_leaves, N)
+        fitted_leaves = _fit_many_sides(X_quad, y, leaf_masks, ridge)  # (n_leaves, n_quad, T)
+        quad_params = quad_params.at[jnp.asarray(leaf_node_ids)].set(fitted_leaves)
 
-    # One vmapped JIT call instead of `n_nodes` Python-loop fits with
-    # per-iteration host syncs. Non-leaf rows fit to zero coefficients
-    # under the ridge prior; we explicitly zero them again to preserve
-    # the public contract that non-leaf nodes have zero quad params.
-    fitted = _fit_many_sides(X_quad, y, masks, ridge)  # (n_nodes, n_quad, T)
-    keep = jnp.asarray(is_leaf_np[:, None, None].astype(np.float64))
-    quad_params = fitted * keep
+    # Flag ONLY leaves with ZERO calibration points as fallback: their
+    # quad params are exactly 0, so σ = |lin - 0| = |prediction| — pure
+    # garbage on the prediction scale. Leaves with few (< n_quad) points
+    # are underdetermined but, with the ridge prior and realistic leaf
+    # sizes, still produce a reasonable, non-exploding |lin - quad| signal
+    # (verified: on a 10-D tree with n_quad=66 and ~25 cal pts/leaf, σ
+    # spans 8e-4..0.39, well within the y scale) — so we KEEP those
+    # estimates rather than collapsing every moderate-dim leaf to a
+    # useless constant.
+    counts = np.zeros(n_nodes, dtype=np.int64)
+    if leaf_ids.size > 0:
+        binc = np.bincount(leaf_ids, minlength=n_nodes)
+        counts[: binc.shape[0]] = binc
+    fallback_np = is_leaf_np & (counts == 0)
 
-    return QuadraticUQState(leaf_quad_params=quad_params)
+    # Global σ = mean |lin - quad| over calibration points routed to
+    # well-fit (non-empty) leaves. Fall back to the mean over all points
+    # only if every leaf is empty (i.e. no calibration data at all).
+    lin_params_cal = np.asarray(tree.leaf_params)[leaf_ids]  # (N, n_aug, T)
+    yh_lin_cal = np.einsum("nf,nft->nt", np.asarray(X_aug), lin_params_cal)
+    yh_quad_cal = np.einsum(
+        "nq,nqt->nt", np.asarray(X_quad), np.asarray(quad_params)[leaf_ids]
+    )
+    sigma_cal = np.abs(yh_lin_cal - yh_quad_cal)  # (N, T)
+    well_fit = ~fallback_np[leaf_ids] if leaf_ids.size > 0 else np.zeros(0, bool)
+    if well_fit.any():
+        global_sigma_np = sigma_cal[well_fit].mean(axis=0)
+    elif sigma_cal.shape[0] > 0:
+        global_sigma_np = sigma_cal.mean(axis=0)
+    else:
+        global_sigma_np = np.zeros(T, dtype=np.float64)
+
+    n_fallback = int(fallback_np.sum())
+    if n_fallback > 0:
+        fb_ids = np.where(fallback_np)[0]
+        preview = fb_ids[:10].tolist()
+        more = "" if fb_ids.size <= 10 else f" (+{fb_ids.size - 10} more)"
+        warnings.warn(
+            f"{n_fallback} leaves received ZERO calibration points; their "
+            f"quadratic_uncertainty falls back to the global mean sigma "
+            f"(a per-leaf σ there would equal |prediction|). Leaf ids: "
+            f"{preview}{more}. Calibrate on data that covers every leaf.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    return QuadraticUQState(
+        leaf_quad_params=quad_params,
+        leaf_is_fallback=jnp.asarray(fallback_np),
+        global_sigma=jnp.asarray(global_sigma_np),
+    )
 
 
 def quadratic_uncertainty(
@@ -104,6 +171,9 @@ def quadratic_uncertainty(
 
     Accepts either a fitted regressor or a `Tree` pytree.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     tree = _resolve_tree(model_or_tree)
     X = jnp.asarray(X, dtype=jnp.float64)
     X_t = X @ tree.transform_matrix
@@ -120,7 +190,18 @@ def quadratic_uncertainty(
     quad_params_per_sample = state.leaf_quad_params[leaf_ids]  # (N, n_quad, T)
     yh_quad = jnp.einsum("nq,nqt->nt", X_quad, quad_params_per_sample)
 
-    out = jnp.abs(yh_lin - yh_quad)
+    out = jnp.abs(yh_lin - yh_quad)  # (N, T)
+
+    # For points routed to fallback leaves (uncovered / underdetermined
+    # quadratic refit), substitute the global sigma instead of the
+    # garbage |lin - 0| the zeroed refit would give.
+    is_fallback = state.leaf_is_fallback[leaf_ids]  # (N,)
+    out = jnp.where(
+        is_fallback[:, None],
+        jnp.broadcast_to(state.global_sigma, out.shape),
+        out,
+    )
+
     if tree.n_targets == 1:
         out = out[:, 0]
     return out
@@ -135,6 +216,9 @@ class QuadraticUQ:
         self._tree: Optional[Tree] = None
 
     def calibrate(self, model_or_tree, X: jnp.ndarray, y: jnp.ndarray) -> "QuadraticUQ":
+        from jax_ldt._validation import _require_x64
+
+        _require_x64()
         self._tree = _resolve_tree(model_or_tree)
         self.state_ = calibrate_quadratic(self._tree, X, y, ridge=self.ridge)
         return self

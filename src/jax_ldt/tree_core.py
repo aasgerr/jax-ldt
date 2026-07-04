@@ -55,7 +55,7 @@ class _GrowNode:
     # for UQ:
     leaf_x_mean: jax.Array  # (n_features,)
     leaf_x_var: jax.Array  # (n_features,)
-    leaf_n: int
+    leaf_n: object  # device scalar for leaves, int 0 for placeholders
     leaf_mse: jax.Array  # (n_targets,)
 
 
@@ -192,15 +192,14 @@ def _evaluate_splits_kernel(
     yh_above = jnp.einsum("nf,ift->int", X_aug, theta_above_flat)
 
     weighted_loss = _weighted_loss(loss_name)
-    loss_below_flat = jax.vmap(lambda yh, w: weighted_loss(y, yh, w))(yh_below, mb_flat)
-    loss_above_flat = jax.vmap(lambda yh, w: weighted_loss(y, yh, w))(yh_above, ma_flat)
-
-    n_total = jnp.sum(node_mask)
-    safe_n_total = jnp.where(n_total > 0.0, n_total, 1.0)
-    overall_flat = (
-        loss_below_flat * n_below.reshape(K * B, 1)
-        + loss_above_flat * n_above.reshape(K * B, 1)
-    ) / safe_n_total
+    # Evaluate the loss of the *combined* piecewise prediction over the
+    # whole node (upstream convention). A row takes its own side's
+    # prediction; rows outside the node get 0 and are excluded by the
+    # node_mask weights. Criterion-correct for every loss: mean-type
+    # losses (mae, msle) reduce to the sample-weighted average of the two
+    # sides, rmse pools under the sqrt, max_abs takes the max across sides.
+    yh_combined = yh_below * mb_flat[:, :, None] + yh_above * ma_flat[:, :, None]
+    overall_flat = jax.vmap(lambda yh: weighted_loss(y, yh, node_mask))(yh_combined)
     overall_flat = jnp.sum(overall_flat, axis=-1)  # sum over targets
     overall_flat = jnp.where(valid.reshape(K * B), overall_flat, jnp.inf)
     overall_flat = jnp.nan_to_num(overall_flat, nan=jnp.inf, posinf=jnp.inf)
@@ -233,10 +232,14 @@ _evaluate_splits = jax.jit(
 )
 
 
-# Leaf-fit alias: the JIT cache from `_fit_one_side` (used vmapped during
-# growth) and a direct call use the same primitives, so we just expose the
-# function under a clearer name. Removing the previous extra `jax.jit(...)`
-# wrapper avoids a redundant trace at leaf-finalisation time.
+# Leaf-fit alias. Kept as the *eager* `_fit_one_side` rather than a
+# separate `jax.jit(...)`: XLA is free to reorder the solve's
+# floating-point ops, so a jitted leaf fit produces ULP-level different
+# leaf coefficients than the eager path. That perturbation is harmless
+# numerically but flips near-tied downstream consumers (notably discopt's
+# big-M MIP, whose feasibility is numerically fragile). The leaf fit is a
+# small fraction of fit cost (the split kernel dominates), so we keep the
+# eager path for exact, reproducible leaf parameters.
 _fit_leaf = _fit_one_side
 
 
@@ -385,6 +388,22 @@ def grow_tree(
     if split_features is None:
         split_features = tuple(i for i in range(n_transformed) if i not in categorical_features)
 
+    # Restrict the leaf/split regressions to `linear_features` (+ bias).
+    # Columns outside the set are zeroed in the *fitting* design matrix
+    # `X_fit`; with a zeroed column, `XᵀWX` carries only `ridge` on that
+    # diagonal and `Xᵀy = 0`, so the solved coefficient is exactly 0.
+    # `X_aug` (all columns) is still used for prediction/UQ downstream,
+    # where those zero coefficients are inert — so `leaf_params` keeps
+    # its `(n_aug, T)` shape and predict/ONNX/JSON/discopt are unchanged.
+    # This is what makes `linear_features` (and, by default, categorical
+    # exclusion) actually affect the leaf models. Routing still uses the
+    # raw `X_t` columns, so `split_features` is unaffected.
+    lin_cols = np.zeros(n_aug, dtype=bool)
+    lin_cols[0] = True  # bias term always retained
+    for f in linear_features:
+        lin_cols[int(f) + 1] = True
+    X_fit = X_aug * jnp.asarray(lin_cols, dtype=X_aug.dtype)[None, :]
+
     # Resolve min_samples_leaf to absolute integer.
     if isinstance(min_samples_leaf, float) and 0.0 < min_samples_leaf < 1.0:
         msl = max(3, int(jnp.ceil(min_samples_leaf * N)))
@@ -415,7 +434,7 @@ def grow_tree(
 
     # --- root node ---
     root_mask = jnp.ones(N, dtype=X_aug.dtype)
-    root_params, root_loss = _initial_leaf(X_aug, y, root_mask, ridge, criterion)
+    root_params, root_loss = _initial_leaf(X_fit, y, root_mask, ridge, criterion)
 
     # node bookkeeping
     nodes: list[_GrowNode] = []
@@ -424,17 +443,17 @@ def grow_tree(
 
     def _leaf_stats(
         mask: jnp.ndarray, params: jnp.ndarray
-    ) -> tuple[jnp.ndarray, jnp.ndarray, int, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Compute (x_mean, x_var, n, mse) for the active rows under ``mask``.
 
         Computed in a single jit'd callable so the four reductions
         (``nm``, ``x_mean``, ``x_var``, ``mse``) share one device kernel
-        invocation. The previous version did each reduction separately
-        and triggered a host sync inside the loop via ``int(nm)``; we
-        return ``nm`` as a JAX scalar and convert at the call site.
+        invocation. ``nm`` is returned as a *device* scalar (not
+        ``int(nm)``): a per-leaf ``int()`` would force a host sync inside
+        the growth loop. The scalars are stacked and converted to int32
+        once at the final packing step instead.
         """
-        x_mean, x_var, nm, mse = _leaf_stats_kernel(mask, X_t, X_aug, y, params)
-        return x_mean, x_var, int(nm), mse
+        return _leaf_stats_kernel(mask, X_t, X_aug, y, params)
 
     def _finalize_leaf(node_id: int, mask: jnp.ndarray, params: jnp.ndarray) -> None:
         """Mark an existing placeholder node as a leaf and populate its
@@ -474,6 +493,9 @@ def grow_tree(
     queue: list[tuple[int, int]] = [(root_id, 0)]
 
     split_feats_arr = jnp.asarray(split_features, dtype=jnp.int32)
+    # Loop-invariant: the split-feature columns of X_t are the same for
+    # every node (only the mask varies), so gather them once.
+    X_split = X_t[:, split_feats_arr]
 
     # Numpy mirror of `X_t` used for all host-side mask arithmetic.
     # Computed once per `grow_tree` call. The JIT'd split kernel still
@@ -495,7 +517,7 @@ def grow_tree(
             or n_active < mss
             or n_active < 2 * msl
         ):
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
@@ -506,13 +528,12 @@ def grow_tree(
         X_split_subdomain = X_t_np[np.ix_(active_idx, split_features)]
         thresholds = _compute_thresholds(X_split_subdomain, max_bins)
         if thresholds.shape[0] == 0:
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
-        X_split = X_t[:, split_feats_arr]
         overall, theta_b, theta_a, n_below, n_above = _evaluate_splits(
-            X_aug,
+            X_fit,
             y,
             mask,
             X_split,
@@ -527,7 +548,7 @@ def grow_tree(
         # trigger a separate transfer per access.
         overall_np = np.asarray(overall)
         if not np.isfinite(overall_np).any():
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
@@ -541,7 +562,7 @@ def grow_tree(
         # non-negative improvement is accepted"; positive values prune.
         impurity_decrease = node_loss[node_id] - best_loss
         if impurity_decrease < min_impurity_decrease:
-            params, _ = _initial_leaf(X_aug, y, mask, ridge, criterion)
+            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
             _finalize_leaf(node_id, mask, params)
             continue
 
@@ -658,27 +679,38 @@ def _route_one(tree: Tree, x_t: jnp.ndarray) -> jnp.ndarray:
     return final_id
 
 
+@jax.jit
+def _predict_jit(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
+    """JIT'd core prediction returning (N, T). `Tree` is a registered
+    pytree (its shape metadata is static aux), so this traces once per
+    fitted tree and reuses the compiled kernel across same-shape calls —
+    the many-small-calls pattern in acquisition/AL loops in particular."""
+    X_t = X @ tree.transform_matrix
+    X_aug = add_bias(X_t)
+    leaf_ids = jax.vmap(lambda x: _route_one(tree, x))(X_t)  # (N,)
+    params_per_sample = tree.leaf_params[leaf_ids]  # (N, n_aug, T)
+    return jnp.einsum("nf,nft->nt", X_aug, params_per_sample)
+
+
 def predict(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
     """Predict for X (N, n_features_in). Returns (N,) or (N, T)."""
     X = jnp.asarray(X, dtype=jnp.float64)
-    X_t = X @ tree.transform_matrix
-    X_aug = add_bias(X_t)
-
-    leaf_ids = jax.vmap(lambda x: _route_one(tree, x))(X_t)  # (N,)
-    # Gather leaf params per sample: (N, n_aug, T)
-    params_per_sample = tree.leaf_params[leaf_ids]
-    # einsum to multiply
-    yh = jnp.einsum("nf,nft->nt", X_aug, params_per_sample)
+    yh = _predict_jit(tree, X)
     if tree.n_targets == 1:
         yh = yh[:, 0]
     return yh
 
 
+@jax.jit
+def _apply_jit(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
+    X_t = X @ tree.transform_matrix
+    return jax.vmap(lambda x: _route_one(tree, x))(X_t)
+
+
 def apply_tree(tree: Tree, X: jnp.ndarray) -> jnp.ndarray:
     """Return leaf node id for each input row."""
     X = jnp.asarray(X, dtype=jnp.float64)
-    X_t = X @ tree.transform_matrix
-    return jax.vmap(lambda x: _route_one(tree, x))(X_t)
+    return _apply_jit(tree, X)
 
 
 # Backwards-compatible alias for the previous private name.

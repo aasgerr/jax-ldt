@@ -137,3 +137,10 @@ contract: no row of `X_batch` is ever silently dropped or duplicated.
   problems.
 - To use `discopt.doe` for FIM-optimal batches, see
   [discopt_integration.md](discopt_integration.md).
+- **Per-round recompile.** Each `tell()` refits the whole tree, and the
+  split kernel's XLA compilation is keyed on the training-set size `N`,
+  which grows every round. So the large inner kernel re-compiles on each
+  round. Prediction is JIT-cached per fitted tree, so `ask()` scoring is
+  cheap; the refit compile is the cost. This is acceptable for typical
+  campaigns (tens of rounds); for very long campaigns with expensive
+  fits, a warm-started growth is future work.

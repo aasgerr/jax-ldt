@@ -85,6 +85,11 @@ class ActiveLearner:
         self.model_factory = model_factory
         self.acquisition = acquisition
         self.batcher = batcher
+        # Whether the batcher arrived with a user-set seed. Recorded ONCE
+        # here: after the first ask() fills in a per-round seed, the field
+        # is no longer None, so re-checking `is None` each round would
+        # freeze it. If the user set a seed, we never override it.
+        self._batcher_seed_user_set = getattr(batcher, "seed", None) is not None
         self.bounds = np.asarray(bounds, dtype=np.float64)
         if self.bounds.ndim != 2 or self.bounds.shape[1] != 2:
             raise ValueError("bounds must have shape (n_features, 2)")
@@ -155,6 +160,13 @@ class ActiveLearner:
             else:
                 if len(y_arr) != len(indices):
                     raise ValueError("len(y) must match len(indices)")
+                n_rows = len(pending.X)
+                if any((i < 0 or i >= n_rows) for i in indices):
+                    raise ValueError(
+                        f"indices must be in [0, {n_rows}); got {indices}"
+                    )
+                if len(set(indices)) != len(indices):
+                    raise ValueError(f"duplicate indices in a single tell: {indices}")
                 if any(i in pending.answered_indices for i in indices):
                     raise ValueError("Some indices in this batch were already answered")
             X_eval = pending.X[indices]
@@ -187,16 +199,47 @@ class ActiveLearner:
         if self.model is None:
             raise RuntimeError("No data yet. Call tell(X_init, y_init) before ask().")
 
-        # Pull pending unanswered points back into the candidate pool by
-        # excluding them so we don't re-propose. (Simpler: never exclude,
-        # since the acquisition already weights novelty via uncertainty.)
         candidates = self._sample_candidates()
+
+        # In fixed-pool mode a tree surrogate's leaf-constant uncertainty
+        # does not collapse at observed points, so an already-labeled or
+        # already-pending pool row can top-rank round after round. Exclude
+        # them by exact row identity (pool rows are reused verbatim, so
+        # float equality is exact) before scoring. Sobol mode draws fresh
+        # points each ask(), so no exclusion is needed there.
+        if self.candidate_pool is not None:
+            used_rows = []
+            if self.X_observed is not None and len(self.X_observed) > 0:
+                used_rows.append(np.asarray(self.X_observed, dtype=np.float64))
+            for pb in self.pending.values():
+                used_rows.append(np.asarray(pb.X, dtype=np.float64))
+            if used_rows:
+                used_set = {tuple(r) for r in np.concatenate(used_rows, axis=0)}
+                keep = np.array(
+                    [tuple(r) not in used_set for r in candidates], dtype=bool
+                )
+                candidates = candidates[keep]
+            if len(candidates) < self.batch_size:
+                raise RuntimeError(
+                    f"candidate pool exhausted: {len(candidates)} unlabeled/"
+                    f"unpending points remain but batch_size={self.batch_size}. "
+                    "Enlarge the pool or answer pending batches first."
+                )
 
         # Acquisition score
         if hasattr(self.acquisition, "update_best"):
             self.acquisition.update_best(self.y_observed)
         scores = np.asarray(self.acquisition.score(self.model, jnp.asarray(candidates)))
 
+        # Give a seed-aware batcher (e.g. DiverseBatchSelector) that has NO
+        # user-set seed a reproducible per-round seed derived from the
+        # loop's fold-in RNG, so k-means++ seeding varies across rounds yet
+        # survives save/load. If the user set an explicit seed, respect it.
+        # We consume an RNG key either way so the candidate/seed stream
+        # stays deterministic regardless of which branch runs.
+        _round_seed = int(jax.random.randint(self._next_rng_key(), (), 0, 2**31 - 1))
+        if hasattr(self.batcher, "seed") and not self._batcher_seed_user_set:
+            self.batcher.seed = _round_seed
         idx = self.batcher.select(candidates, scores, self.batch_size)
         X_batch = candidates[idx]
         scores_batch = scores[idx]

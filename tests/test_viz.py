@@ -72,3 +72,26 @@ def test_plot_calibration_with_sigma_and_intervals(rng) -> None:
     out = plot_calibration(y_true, y_pred, sigma=sigma, intervals=(lo, hi))
     assert isinstance(out, matplotlib.axes.Axes)
     plt.close(out.figure)
+
+
+def test_plot_calibration_band_x_matches_y_true(rng) -> None:
+    """M14: the prediction band must be drawn on the y_true x-axis (where
+    the points sit), not the y_pred axis."""
+    plt = pytest.importorskip("matplotlib.pyplot")
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+
+    from jax_ldt import plot_calibration
+
+    y_true = rng.normal(size=30)
+    y_pred = y_true + 0.5 * rng.normal(size=30)  # meaningful deviation
+    lo = y_pred - 0.2
+    hi = y_pred + 0.2
+
+    ax = plot_calibration(y_true, y_pred, intervals=(lo, hi))
+    # The fill_between poly's x-vertices must span sorted y_true, not y_pred.
+    coll = ax.collections[0]
+    xs = coll.get_paths()[0].vertices[:, 0]
+    assert abs(xs.min() - y_true.min()) < 1e-9
+    assert abs(xs.max() - y_true.max()) < 1e-9
+    plt.close(ax.figure)

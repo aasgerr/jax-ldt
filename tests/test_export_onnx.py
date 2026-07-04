@@ -109,3 +109,46 @@ def test_onnx_multi_target(rng) -> None:
     yh_onnx = _run_onnx(model_proto, X[:25])
     assert yh_onnx.shape == (25, 2)
     np.testing.assert_allclose(yh_jax, yh_onnx, atol=1e-8)
+
+
+@pytest.mark.onnx
+def test_onnx_ir_version_is_minimal_and_opset_validated(rng) -> None:
+    """M15: ir_version must be pinned to the minimum the opset requires
+    (not the installed lib's newest), and opset < 13 must raise early."""
+    from onnx import helper
+
+    X = rng.uniform(-1.0, 1.0, size=(80, 2)).astype(np.float64)
+    y = X.sum(axis=1)
+    model = LinearTreeRegressor(max_depth=3, max_bins=5, min_samples_leaf=10).fit(X, y)
+
+    proto = to_onnx(model, opset=18)
+    expected = helper.find_min_ir_version_for([helper.make_opsetid("", 18)])
+    assert proto.ir_version == expected
+
+    with pytest.raises(ValueError, match="opset >= 13"):
+        to_onnx(model, opset=12)
+
+
+@pytest.mark.onnx
+def test_onnx_fidelity_at_split_thresholds(rng) -> None:
+    """Phase 5: evaluate inputs exactly at split thresholds; the ONNX
+    graph's LessOrEqual routing must match predict() there."""
+    X = rng.uniform(-2.0, 2.0, size=(300, 2)).astype(np.float64)
+    y = X[:, 0] ** 2 + X[:, 1]
+    model = LinearTreeRegressor(max_depth=4, max_bins=6, min_samples_leaf=15).fit(X, y)
+    proto = to_onnx(model)
+
+    tree = model.tree_
+    is_leaf = np.asarray(tree.is_leaf)
+    feats = np.asarray(tree.feature)[~is_leaf]
+    thrs = np.asarray(tree.threshold)[~is_leaf]
+    # Build test points sitting exactly on each split threshold.
+    pts = []
+    for f, t in zip(feats, thrs):
+        p = np.zeros(2)
+        p[int(f)] = float(t)
+        pts.append(p)
+    Xt = np.array(pts, dtype=np.float64)
+    yh_jax = np.asarray(model.predict(Xt))
+    yh_onnx = _run_onnx(proto, Xt).reshape(yh_jax.shape)
+    np.testing.assert_allclose(yh_jax, yh_onnx, atol=1e-8)

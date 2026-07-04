@@ -65,6 +65,10 @@ Optional extras:
 ## Quickstart
 
 ```python
+# jax-ldt requires 64-bit JAX; enable it BEFORE importing jax/jax_ldt.
+import os
+os.environ["JAX_ENABLE_X64"] = "1"
+
 import jax.numpy as jnp
 from jax_ldt import HyperplaneTreeRegressor
 
@@ -83,8 +87,10 @@ or when you specifically want axis-aligned cuts.
 ## Training
 
 Both regressors expose a scikit-learn-style `.fit(X, y) / .predict(X)`
-interface. Inputs may be NumPy or JAX arrays; computation is
-`float64` by default.
+interface. Inputs may be NumPy or JAX arrays; computation is in
+`float64`, which **requires** JAX 64-bit mode (`JAX_ENABLE_X64=1`,
+enforced at fit time — jax-ldt raises a clear `RuntimeError` if it is
+off, since float32 would silently corrupt the ridge solve).
 
 | param | default | effect |
 |-------|---------|--------|

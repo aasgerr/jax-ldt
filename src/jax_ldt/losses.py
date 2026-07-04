@@ -23,14 +23,18 @@ def _broadcast_weights(weights: jnp.ndarray, like: jnp.ndarray, dim: int) -> jnp
 
 
 def _safe_weighted_mean(num: jnp.ndarray, w: jnp.ndarray, dim: int) -> jnp.ndarray:
-    """Σ(num) / Σ(w), with Σ(w)==0 → 0 instead of NaN.
+    """Σ(num) / Σ(w), with Σ(w)==0 → ``inf`` instead of NaN.
 
     Mirrors the zero-weight guards used by the inner-kernel weighted
-    losses in :mod:`tree_core` so public and private paths agree.
+    losses in :mod:`tree_core`, which return ``inf`` (an empty subdomain
+    is "invalid / infinitely bad", so a downstream improvement check
+    rejects it). The previous ``0.0`` sentinel meant a caller using this
+    public loss to reproduce a split decision saw "perfect" where the
+    kernel saw "invalid".
     """
     sw = jnp.sum(w, axis=dim)
     safe_sw = jnp.where(sw > 0, sw, 1)
-    return jnp.where(sw > 0, jnp.sum(num, axis=dim) / safe_sw, 0.0)
+    return jnp.where(sw > 0, jnp.sum(num, axis=dim) / safe_sw, jnp.inf)
 
 
 def mae(y: jnp.ndarray, yh: jnp.ndarray, weights: Optional[jnp.ndarray] = None,
@@ -66,7 +70,15 @@ def max_abs(y: jnp.ndarray, yh: jnp.ndarray, weights: Optional[jnp.ndarray] = No
     err = jnp.abs(y - yh)
     if weights is not None:
         w = _broadcast_weights(weights, err, dim)
-        err = err * w
+        # A true weighted max EXCLUDES zero-weight rows rather than
+        # scaling their error to zero (which `err * w` does — fine for
+        # 0/1 masks, but for importance weights it silently shrinks
+        # errors before the max). Mask excluded rows to -inf; an
+        # all-excluded slice returns inf (matching the mean-loss guard).
+        masked = jnp.where(w > 0, err, -jnp.inf)
+        m = jnp.max(masked, axis=dim)
+        sw = jnp.sum(w, axis=dim)
+        return jnp.where(sw > 0, m, jnp.inf)
     return jnp.max(err, axis=dim)
 
 

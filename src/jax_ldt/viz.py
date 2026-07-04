@@ -77,8 +77,8 @@ def plot_calibration(
         Per-sample standard deviation; drawn as symmetric error bars on
         ``y_pred``.
     intervals : optional tuple of two arrays (lo, hi)
-        Lower / upper prediction bounds; drawn as a shaded band sorted
-        by ``y_pred``.
+        Lower / upper prediction bounds; drawn as a shaded band along the
+        ``y_true`` axis (matching where the points are plotted).
     ax : optional matplotlib Axes
 
     Returns
@@ -100,9 +100,12 @@ def plot_calibration(
         lo, hi = intervals
         lo = np.asarray(lo).reshape(-1)
         hi = np.asarray(hi).reshape(-1)
-        order = np.argsort(y_pred)
+        # Points are plotted at x=y_true; the band must share that x-axis
+        # so it actually brackets them. Ordering/filling by y_pred (the
+        # y-axis) offset the band horizontally from the points it covers.
+        order = np.argsort(y_true)
         ax.fill_between(
-            y_pred[order],
+            y_true[order],
             lo[order],
             hi[order],
             alpha=0.2,

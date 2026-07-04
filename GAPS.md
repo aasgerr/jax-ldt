@@ -21,6 +21,75 @@ For the list of items already resolved by prior work, see the
 
 ---
 
+## 2026-07 remediation pass (review-driven)
+
+A full-codebase review (correctness / thoroughness / performance) drove
+a large remediation pass. Each item below was reproduced, fixed, and
+pinned with a regression test. Summary:
+
+**High (silent wrong answers):**
+- **H1/H2.** `linear_features` is now actually applied (excluded columns
+  zeroed in the fitting design matrix → exactly-zero coefficients);
+  categorical columns no longer get leaf coefficients. See the G-17 note
+  below.
+- **H3.** JAX x64 is enforced at every public `fit`/`predict`/`calibrate`
+  /export boundary (`_require_x64`); without it float64 was silently
+  demoted to float32. README/SKILL updated.
+- **H4.** `rmse`/`max_abs` split selection now evaluates the combined
+  piecewise prediction over the node (upstream convention); the old
+  sample-weighted average was wrong for these criteria. `mae`/`msle`
+  unchanged.
+- **H5.** discopt `big_m` is a genuine big-M constant (was misused as a
+  feature-box half-width), validated against derived bounds.
+
+**Medium:** M1 optional strict MIP boundary (`boundary_eps`); M2 ±1e20
+sentinel guard; M3 conformal small-leaf clip warning + alpha-derived
+`min_calibration_per_leaf`; M4 empty-calibration raise; M5 stale-model
+guard; M6 QuadraticUQ global-σ fallback for sparse/underdetermined
+leaves; M7 pool-mode dedup; M8 `tell` index validation; M9
+DiverseBatchSelector uniqueness/seed; M10 GreedyMaxMin `scale`; M11
+sklearn NotFittedError + uniform-average R² + HT wrapper; M12 dedup
+warning only on rounding collapse; M13 `do_symmetrize=False` oblique
+rows kept; M14 calibration-band x-axis; M15 ONNX `ir_version` +
+opset guard.
+
+**Performance:** P1 split-kernel candidate chunking (`lax.map`) to bound
+peak memory; P2 hoisted `X_split` + deferred per-leaf sync (the leaf-fit
+JIT was **reverted** — XLA float reordering perturbed leaf params and
+flipped discopt's fragile solver; leaf fits are cheap, so eager wins on
+reproducibility); P3 JIT `predict`/`apply`; P4 vectorized JSON NaN
+codec + `allow_nan=False`; P5 device-side finite check; P6 QuadraticUQ
+fits only leaves.
+
+**Design decisions worth knowing:**
+- **linprop is epistemic-only.** `linprop_uncertainty` is the faithful
+  epistemic (fitted-mean) port. A `mode="prediction"` predictive std was
+  attempted but **removed** (third review): a parametric predictive std
+  can't be estimated reliably from a tree's own leaf residuals —
+  interpolating / over-parameterized leaves (the norm for hyperplane
+  trees) have ~0 residual, and trees create heteroscedastic leaves, so a
+  global noise floor is both incoherent (it leaks into the leverage term)
+  and vanishes for HT. For predictive intervals use conformal. The
+  leverage sum is now restricted to the leaf's `linear_features` (H1:
+  excluded/categorical dims have zero coefficient and must not inflate σ).
+- **`ridge` is absolute** (not scale-invariant): standardize features at
+  scale ≳ 1e6. A relative-ridge option is deferred, not silently applied.
+- **P1 was reverted.** The `lax.map` candidate-chunking optimization was
+  removed (third review): it ran ~2.3× slower than the fused vmap on deep
+  hyperplane trees (scan compile/overhead) and, being only per-candidate
+  numerically equivalent (~1e-14), could flip an exact-tie split and
+  change the tree. The split kernel is back to the fused vmap+einsum. The
+  O(K·B·N·T) peak-memory concern it targeted is a known limitation at
+  extreme sizes (e.g. 200k rows × 50 split features × 24 bins); chunk the
+  data or reduce `max_bins`/`num_terms` there.
+- **x64 enforced everywhere.** `_require_x64` guards not just fit/predict
+  but every UQ (`linprop_uncertainty`, `quadratic_uncertainty`,
+  `calibrate_quadratic`, `ConformalCalibrator.calibrate/predict_interval`)
+  and loader (`from_json`) entry point, so a tree can't silently run in
+  float32 after being loaded in an x64-off process.
+
+---
+
 ## Medium — undocumented mismatches, missing test paths, footguns
 
 ### G-19 (residual). Planned API surfaces still not delivered
@@ -219,7 +288,16 @@ intervening work and are kept here for historical reference.
   is called at every public `fit` / `predict` / `calibrate` boundary.
 - **G-17.** HT/LMDT parameter symmetry — `HyperplaneTreeRegressor`
   now exposes `linear_features` and `split_features`, threaded through
-  to `grow_tree`.
+  to `grow_tree`. **Note (2026-07):** `split_features` was applied, but
+  `linear_features` was only stored in `Tree` metadata and never used
+  by the leaf fits — see H1 below. Now fully applied.
+- **H1/H2 (2026-07).** `linear_features` is now enforced: `grow_tree`
+  zeroes excluded columns in the fitting design matrix so their leaf
+  coefficients are exactly 0 (`leaf_params` shape unchanged, so
+  predict/ONNX/JSON/discopt are unaffected). Categorical features,
+  which are excluded from the default `linear_features`, therefore no
+  longer receive leaf-model coefficients — matching the documented
+  contract. Pinned by `tests/test_linear_features.py`.
 - **G-18.** `MaxVariance` — has a real `score` method (no longer an
   empty dataclass), even if the implementation is short.
 - **G-19 (planned files).** `viz.py`, `sklearn_compat.py`,

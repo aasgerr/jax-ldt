@@ -211,3 +211,17 @@ def test_grow_tree_rejects_unknown_criterion():
     y = X[:, 0]
     with pytest.raises(ValueError, match="Unknown criterion"):
         grow_tree(X, y, criterion="huber")
+
+
+def test_leaf_n_matches_routed_counts(rng):
+    """P2: leaf_uq.n (packed from deferred device scalars) must equal the
+    actual number of training rows routed to each leaf."""
+    X = rng.uniform(-1, 1, size=(300, 2))
+    y = X[:, 0] ** 2 + X[:, 1]
+    tree = grow_tree(X, y, max_depth=3, max_bins=6, min_samples_leaf=15)
+    leaf_ids = np.asarray(apply_tree(tree, jnp.asarray(X)))
+    n = np.asarray(tree.leaf_uq.n)
+    is_leaf = np.asarray(tree.is_leaf)
+    counts = np.bincount(leaf_ids, minlength=len(n))
+    for nid in np.where(is_leaf)[0]:
+        assert n[nid] == counts[nid], f"leaf {nid}: stored {n[nid]} vs routed {counts[nid]}"

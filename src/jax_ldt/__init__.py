@@ -47,11 +47,11 @@ def plot_calibration(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
-def __getattr__(name):  # pragma: no cover - exercised by SklearnLinearTreeRegressor test
-    if name == "SklearnLinearTreeRegressor":
-        from jax_ldt.sklearn_compat import SklearnLinearTreeRegressor
+def __getattr__(name):  # pragma: no cover - exercised by sklearn wrapper tests
+    if name in ("SklearnLinearTreeRegressor", "SklearnHyperplaneTreeRegressor"):
+        import jax_ldt.sklearn_compat as _sk
 
-        return SklearnLinearTreeRegressor
+        return getattr(_sk, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -79,6 +79,11 @@ __all__ = [
     "plot_tree_partition_2d",
     "plot_calibration",
     "SklearnLinearTreeRegressor",
+    "SklearnHyperplaneTreeRegressor",
+    "build_transform_matrix",
+    "generate_planes_to_index",
+    "lift",
+    "symmetrize",
 ]
 
 __version__ = "0.0.1"

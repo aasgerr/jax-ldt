@@ -6,6 +6,7 @@ Each selector implements `.select(X_candidates, scores, k) -> indices`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -21,21 +22,24 @@ class TopKBatchSelector:
 
 @dataclass
 class GreedyMaxMinBatchSelector:
-    """Greedy with min-distance penalty.
+    """Greedy score/diversity trade-off with a farthest-point penalty.
 
-    At each step, pick the candidate maximizing
-        score(x) - lambda * (max_distance_to_already_chosen)^(-1)
-    using the simple form
-        adjusted_score(x) = score(x) - lambda * d_min(x, already_chosen) ^ (-1)
-    Equivalently, we just take the highest-score point that is at least
-    `min_distance_factor * max_pairwise_distance` away from all chosen.
+    The first pick is the highest-scoring candidate. Each subsequent pick
+    maximizes
 
-    For practical use we implement the standard "scoring with farthest-
-    point penalty": for each candidate compute its current min distance
-    to the chosen set; weight the score by tanh(distance / scale).
+        (1 - diversity_weight) * score_norm(x)
+            + diversity_weight * tanh(d_min(x, chosen) / scale)
+
+    where ``score_norm`` is the score rescaled to ``[0, 1]``, ``d_min`` is
+    the Euclidean distance (in range-normalized coordinates) to the
+    nearest already-chosen point, and ``scale`` sets the distance at
+    which the diversity term saturates. Range-normalized distances in
+    ≥2-D routinely exceed 1, so a ``scale`` of ~1 keeps ``tanh`` in its
+    informative regime rather than saturated at ~1 for every candidate.
     """
 
     diversity_weight: float = 0.5
+    scale: float = 1.0
 
     def select(self, X_candidates: np.ndarray, scores: np.ndarray, k: int) -> np.ndarray:
         X = np.asarray(X_candidates)
@@ -61,9 +65,11 @@ class GreedyMaxMinBatchSelector:
         # min-dist to chosen, updated incrementally
         dist_to_chosen = np.linalg.norm(Xn - Xn[chosen[0]], axis=1)
 
+        scale = self.scale if self.scale > 0 else 1.0
         for _ in range(k - 1):
-            # diversity term in [0, 1]: 1 if far, 0 if close
-            divs = np.tanh(dist_to_chosen)
+            # diversity term in [0, 1]: 1 if far, 0 if close. Dividing by
+            # `scale` keeps tanh unsaturated for range-normalized dists.
+            divs = np.tanh(dist_to_chosen / scale)
             adjusted = (1.0 - self.diversity_weight) * s + self.diversity_weight * divs
             adjusted[chosen] = -np.inf
             nxt = int(np.argmax(adjusted))
@@ -83,7 +89,7 @@ class DiverseBatchSelector:
     """
 
     pool_factor: int = 5  # consider pool_factor * k top candidates
-    diversity_weight: float = 0.3  # unused here; kept for API symmetry
+    seed: Optional[int] = None  # k-means++ seeding RNG (None -> fresh entropy)
 
     def select(self, X_candidates: np.ndarray, scores: np.ndarray, k: int) -> np.ndarray:
         X = np.asarray(X_candidates)
@@ -95,8 +101,10 @@ class DiverseBatchSelector:
         pool = order[:pool_size]
         Xp = X[pool]
 
-        # Simple k-means++-style seeding then 5 Lloyd iterations.
-        rng = np.random.default_rng(0)
+        # Simple k-means++-style seeding then 5 Lloyd iterations. The
+        # ActiveLearner sets `seed` per round from its reproducible RNG;
+        # standalone use may leave it None (fresh entropy).
+        rng = np.random.default_rng(self.seed)
         ranges = X.max(axis=0) - X.min(axis=0)
         ranges = np.where(ranges < 1e-8, 1.0, ranges)
         Xn = Xp / ranges
@@ -144,17 +152,24 @@ class DiverseBatchSelector:
         pool_scores = scores[pool]
         for c in range(n_centers):
             members = np.where(assigns == c)[0]
-            if len(members) == 0:
-                # No member: pick highest-score candidate not used yet
+            # Pick this cluster's highest-scoring member that hasn't
+            # already been chosen (e.g. by an earlier empty-cluster
+            # fallback); otherwise fall through to the global unused best.
+            # Without the `used` check the same point could be returned
+            # twice, yielding a batch with fewer than k distinct points.
+            picked = None
+            for mi in members[np.argsort(-pool_scores[members])]:
+                if int(pool[mi]) not in used:
+                    picked = int(pool[mi])
+                    break
+            if picked is None:
                 for idx in np.argsort(-pool_scores):
                     if int(pool[idx]) not in used:
-                        chosen.append(int(pool[idx]))
-                        used.add(int(pool[idx]))
+                        picked = int(pool[idx])
                         break
-                continue
-            best_local = members[np.argmax(pool_scores[members])]
-            chosen.append(int(pool[best_local]))
-            used.add(int(pool[best_local]))
+            if picked is not None:
+                chosen.append(picked)
+                used.add(picked)
 
         # If we ended k-means++ early (every pool point coincided with
         # a chosen center), pad with the highest-score unused candidates.

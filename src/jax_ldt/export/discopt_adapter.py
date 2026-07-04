@@ -67,6 +67,21 @@ def to_discopt_decision_tree(model_or_tree):
         if tree is None:
             raise ValueError("Pass a fitted model or a Tree pytree.")
 
+    # The returned DecisionTree splits on the *transformed* feature space.
+    # For an axis-aligned LMDT that equals the raw input space (identity
+    # transform), but a hyperplane tree lifts features — silently emitting
+    # a DecisionTree over lifted columns would mis-route a consumer that
+    # feeds raw x, with no dimension error to catch it.
+    A = np.asarray(tree.transform_matrix)
+    n_in = int(tree.n_features_in)
+    if A.shape != (n_in, n_in) or not np.allclose(A, np.eye(n_in)):
+        raise ValueError(
+            "to_discopt_decision_tree requires an identity transform_matrix "
+            "(axis-aligned tree). This tree lifts features into an oblique "
+            "space, so the DecisionTree would split on lifted columns and a "
+            "raw-x consumer would mis-route. Use embed_in_discopt_model instead."
+        )
+
     leaf_params = np.asarray(tree.leaf_params)  # (n_nodes, n_aug, T)
     is_leaf = np.asarray(tree.is_leaf)
     # For "constant-leaf" check: every leaf row must have only the bias entry nonzero.
@@ -156,6 +171,7 @@ def embed_in_discopt_model(
     x_vars,
     *,
     big_m: Optional[float] = None,
+    boundary_eps: float = 0.0,
     name_prefix: str = "tree",
 ):
     """Embed a trained tree into a `discopt.Model` as a hybrid disjunction.
@@ -167,9 +183,28 @@ def embed_in_discopt_model(
     x_vars        : a discopt Variable / Expression of shape
                     (n_features_in,). Use `m.continuous("x", shape=(n,))`
                     to create one.
-    big_m         : optional override for the big-M constant. If None,
-                    we compute one from feature ranges in the lifted
-                    space (max - min of A · bound_box) + 1e-3.
+    big_m         : optional big-M *constant*. If None (recommended),
+                    per-node and per-leaf big-Ms are derived from the
+                    bounds `x_vars` exposes on `x` (tightest valid
+                    formulation). If given, it is used directly for every
+                    routing and leaf-output constraint; when `x_vars`
+                    also exposes bounds, a `big_m` too small to be a
+                    valid bound raises `ValueError` rather than silently
+                    producing an infeasible / wrong MIP.
+    boundary_eps  : strict-inequality margin for the right branch,
+                    default 0 (off). In memory a point with `x'_f == t`
+                    routes LEFT (`<=`), but a naive MIP encodes both
+                    branches non-strictly so the optimizer can route a
+                    boundary point either way and pick the lower-valued
+                    leaf. Setting `boundary_eps > 0` encodes the right
+                    branch as `x'_f >= t + boundary_eps`, breaking the
+                    tie toward the in-memory convention. It is OFF by
+                    default because the resulting open gap `(t, t+eps)`
+                    can make some big-M solvers report spurious
+                    infeasibility; enable it (with `eps` above your
+                    solver's feasibility tolerance) only when boundary
+                    tie-breaking matters. MIP optima within `eps` of a
+                    threshold remain inherently ambiguous.
     name_prefix   : prefix for auto-generated variables.
 
     Returns
@@ -177,6 +212,9 @@ def embed_in_discopt_model(
     y_expr : list of `discopt.Expression`, one per output target.
              For the common single-target case, you can use `y_expr[0]`.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     discopt = _check_discopt()
 
     if isinstance(model_or_tree, Tree):
@@ -213,55 +251,75 @@ def embed_in_discopt_model(
     # Exactly one active
     m.subject_to(sum(z[i] for i in range(n_leaves)) == 1)
 
-    # Bounds-driven big-M:
-    #   lb_t[j], ub_t[j] = bounds on x'_j = Σ_i A[i,j] x_i induced by the
-    #   bounds on x. Used for:
-    #     - per-node routing M, which must dominate |x'_f − t|
-    #     - per-leaf output M, which must dominate |α_k + β_k·x'|
-    #   When x_vars exposes no usable bounds and the user did not override
-    #   big_m, we fall back to a single large constant and warn.
-    fallback = 1e6 if big_m is None else float(big_m)
+    # Big-M setup. Two independent big-M families are needed:
+    #   - per-node routing M, which must dominate |x'_f − t|
+    #   - per-leaf output M, which must dominate |α_k + β_k·x'|
+    # Both are derived from lb_t[j], ub_t[j] = bounds on
+    # x'_j = Σ_i A[i,j] x_i induced by the bounds on x.
+    #
+    # `big_m`, when given, is a genuine big-M *constant* (not a feature
+    # box): it directly sets m_left = m_right = m_k. We still derive the
+    # true bounds when x_vars exposes them and RAISE if the user's big_m
+    # is too small to be a valid bound — a silently invalid MIP (whole
+    # subtrees cut off) is the worst outcome. When neither big_m nor
+    # usable bounds are available we fall back to a large constant + warn.
+    user_big_m = None if big_m is None else float(big_m)
     margin = 1e-3
-    have_bounds = False
-    if big_m is None:
-        try:
-            lb = np.asarray(getattr(x_vars, "lb", None), dtype=np.float64)
-            ub = np.asarray(getattr(x_vars, "ub", None), dtype=np.float64)
-            if (
-                lb.size == n_in
-                and ub.size == n_in
-                and np.all(np.isfinite(lb))
-                and np.all(np.isfinite(ub))
-            ):
-                have_bounds = True
-            else:
-                warnings.warn(
-                    f"embed_in_discopt_model: x_vars bounds not finite or wrong size "
-                    f"(lb.size={lb.size}, ub.size={ub.size}, expected {n_in}); "
-                    f"falling back to big_m={fallback}. Pass big_m=... explicitly "
-                    f"for a tighter formulation.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-        except (AttributeError, TypeError):
-            warnings.warn(
-                f"embed_in_discopt_model: x_vars does not expose lb/ub; "
-                f"falling back to big_m={fallback}. Pass big_m=... explicitly "
-                f"for a tighter formulation.",
-                UserWarning,
-                stacklevel=2,
-            )
 
-    if have_bounds:
-        # x'_j = Σ_i A[i,j] x_i; with x ∈ [lb, ub] this gives
-        #   lb_t[j] = Σ_i (A[i,j] · (lb if A>=0 else ub))
-        #   ub_t[j] = Σ_i (A[i,j] · (ub if A>=0 else lb))
-        At = A.T  # (n_t, n_in)
-        At_pos = np.maximum(At, 0.0)
-        At_neg = np.minimum(At, 0.0)
-        lb_t = At_pos @ lb + At_neg @ ub
-        ub_t = At_pos @ ub + At_neg @ lb
-    else:
+    # Derive lifted-space bounds from x_vars if usable. Solver "unbounded"
+    # sentinels (discopt uses ±1e20) are finite but numerically toxic as
+    # a big-M, so anything with |bound| > 1e10 is treated as unbounded.
+    have_bounds = False
+    lb_t = ub_t = None
+    try:
+        lb = np.asarray(getattr(x_vars, "lb", None), dtype=np.float64)
+        ub = np.asarray(getattr(x_vars, "ub", None), dtype=np.float64)
+        if (
+            lb.size == n_in
+            and ub.size == n_in
+            and np.all(np.isfinite(lb))
+            and np.all(np.isfinite(ub))
+            and np.max(np.abs(lb)) <= 1e10
+            and np.max(np.abs(ub)) <= 1e10
+        ):
+            # x'_j = Σ_i A[i,j] x_i; with x ∈ [lb, ub]:
+            #   lb_t[j] = Σ_i (A[i,j] · (lb if A>=0 else ub))
+            #   ub_t[j] = Σ_i (A[i,j] · (ub if A>=0 else lb))
+            At = A.T  # (n_t, n_in)
+            At_pos = np.maximum(At, 0.0)
+            At_neg = np.minimum(At, 0.0)
+            lb_t = At_pos @ lb + At_neg @ ub
+            ub_t = At_pos @ ub + At_neg @ lb
+            have_bounds = True
+    except (AttributeError, TypeError):
+        pass
+
+    if not have_bounds and user_big_m is not None:
+        # We cannot validate the user's big_m without bounds, so we can't
+        # guarantee it is large enough — an undersized big_m would silently
+        # cut off subtrees (the H5 failure mode). Warn rather than trust it
+        # blindly.
+        warnings.warn(
+            f"embed_in_discopt_model: big_m={user_big_m} cannot be validated "
+            "because x_vars exposes no usable finite bounds; if it is smaller "
+            "than some split threshold or leaf-output magnitude the MIP will "
+            "silently cut off feasible leaves. Set finite bounds on x_vars so "
+            "big_m can be checked, or ensure big_m comfortably exceeds the "
+            "feature/threshold scale.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if not have_bounds and user_big_m is None:
+        fallback = 1e6
+        warnings.warn(
+            "embed_in_discopt_model: x_vars exposes no usable finite bounds "
+            f"(needed size {n_in}, |bound| <= 1e10); falling back to "
+            f"big_m={fallback}. Pass big_m=... explicitly, or set tighter "
+            "bounds on x_vars, for a tighter and safer formulation.",
+            UserWarning,
+            stacklevel=2,
+        )
         lb_t = np.full(n_t, -fallback, dtype=np.float64)
         ub_t = np.full(n_t, fallback, dtype=np.float64)
 
@@ -284,13 +342,28 @@ def embed_in_discopt_model(
         right_leaves = descendants[int(right_arr[nid])]
 
         # Per-side big-M: worst-case |x'_f − t| under bounds.
-        m_left = float(max(ub_t[f] - t, 0.0)) + margin
-        m_right = float(max(t - lb_t[f], 0.0)) + margin
+        if user_big_m is not None:
+            if have_bounds:
+                req = max(float(ub_t[f]) - t, t + boundary_eps - float(lb_t[f]), 0.0)
+                if user_big_m < req:
+                    raise ValueError(
+                        f"big_m={user_big_m} is too small: node {nid} splitting "
+                        f"lifted feature {f} at t={t:g} needs a routing big-M of "
+                        f"at least {req:g} to avoid cutting off feasible leaves. "
+                        "Increase big_m or pass tighter x_vars bounds."
+                    )
+            m_left = m_right = user_big_m
+        else:
+            m_left = float(max(ub_t[f] - t, 0.0)) + margin
+            m_right = float(max(t + boundary_eps - lb_t[f], 0.0)) + margin
 
         sum_left = sum(z[leaf_id_to_z[lid]] for lid in left_leaves)
         sum_right = sum(z[leaf_id_to_z[lid]] for lid in right_leaves)
+        # In-memory routing sends x'_f == t LEFT; encode the right branch
+        # strictly (x'_f >= t + boundary_eps) so a boundary point can't be
+        # routed either way to game the objective.
         m.subject_to(x_t[f] - t <= m_left * (1 - sum_left))
-        m.subject_to(t - x_t[f] <= m_right * (1 - sum_right))
+        m.subject_to(t + boundary_eps - x_t[f] <= m_right * (1 - sum_right))
 
     # Output expression: y = Σ_k z_k · (β_k · x' + α_k)
     # β_k · x' + α_k where leaf_params[k, :, t] = [α_k, β_k_1, β_k_2, ...].
@@ -314,9 +387,23 @@ def embed_in_discopt_model(
             # Per-leaf output bounds: |α + Σ_j β_j x'_j| ≤ M_k.
             beta_pos = np.maximum(betas, 0.0)
             beta_neg = np.minimum(betas, 0.0)
-            lin_lb = alpha + float(beta_pos @ lb_t + beta_neg @ ub_t)
-            lin_ub = alpha + float(beta_pos @ ub_t + beta_neg @ lb_t)
-            m_k = max(abs(lin_lb), abs(lin_ub)) + margin
+            if user_big_m is not None:
+                if have_bounds:
+                    lin_lb = alpha + float(beta_pos @ lb_t + beta_neg @ ub_t)
+                    lin_ub = alpha + float(beta_pos @ ub_t + beta_neg @ lb_t)
+                    req = max(abs(lin_lb), abs(lin_ub))
+                    if user_big_m < req:
+                        raise ValueError(
+                            f"big_m={user_big_m} is too small: leaf {lid} "
+                            f"(target {tgt}) has output magnitude up to {req:g}; "
+                            "the v_k linearization needs a big-M at least that "
+                            "large. Increase big_m or pass tighter x_vars bounds."
+                        )
+                m_k = user_big_m
+            else:
+                lin_lb = alpha + float(beta_pos @ lb_t + beta_neg @ ub_t)
+                lin_ub = alpha + float(beta_pos @ ub_t + beta_neg @ lb_t)
+                m_k = max(abs(lin_lb), abs(lin_ub)) + margin
 
             # Big-M constraints linking v_k to z_k * lin_expr.
             m.subject_to(v[k] <= m_k * z[k])

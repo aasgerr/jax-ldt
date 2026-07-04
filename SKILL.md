@@ -17,7 +17,8 @@ splits can follow oblique directions, not just axis-aligned cuts.
 Key differences from upstream:
 
 - Pure JAX numerics — `jnp` arrays end-to-end, JIT on the hot inner
-  split kernel, vmapped ridge fits, `float64` by default.
+  split kernel, vmapped ridge fits, `float64` throughout (requires
+  `JAX_ENABLE_X64=1`, enforced at fit time).
 - **No Pyomo / OMLT runtime dependency.** Trained models export to
   JSON or ONNX (consumable by OMLT externally) and embed directly in
   `discopt` MINLPs.

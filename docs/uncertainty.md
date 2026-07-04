@@ -12,12 +12,23 @@ variance `σ²`, and leaf MSE `m`:
 
 The first term is the leaf's residual variance scaled by sample count
 (epistemic); the second grows with distance from the leaf's training
-mean (extrapolation penalty). Cheap, no calibration step required.
+mean (extrapolation penalty), summed only over the features the leaf
+model actually uses (`linear_features`). Cheap, no calibration step
+required.
 
 ```python
 from jax_ldt import LinearPropagationUQ
 sigma = LinearPropagationUQ().predict(model.tree_, X)
 ```
+
+This is an **epistemic** (fitted-mean) std — it collapses toward 0 at
+leaf centres and does **not** include irreducible noise, so it is not a
+calibrated predictive std. For a **predictive interval** with a
+finite-sample coverage guarantee, use conformal prediction (below); a
+parametric predictive std cannot be estimated reliably from a tree's own
+leaf residuals (interpolating / over-parameterized leaves — the norm for
+hyperplane trees — have ~0 residual, and trees deliberately create
+heteroscedastic leaves).
 
 ## Quadratic-difference UQ
 

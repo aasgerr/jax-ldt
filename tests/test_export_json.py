@@ -83,3 +83,36 @@ def test_kind_explicit_override(toy_1d) -> None:
     model = LinearTreeRegressor(max_depth=2, max_bins=3, min_samples_leaf=10).fit(X, y)
     s = to_json(model, kind="my_custom_label")
     assert '"kind": "my_custom_label"' in s
+
+
+def test_json_roundtrip_preserves_leaf_uq(branin_2d) -> None:
+    """Phase 5: leaf_uq fields must round-trip exactly, not just predictions."""
+    X, y = branin_2d
+    model = LinearTreeRegressor(max_depth=4, max_bins=8, min_samples_leaf=15).fit(X, y)
+    tree = from_json(to_json(model))
+    for field in ("n", "x_mean", "x_var", "mse"):
+        orig = np.asarray(getattr(model.tree_.leaf_uq, field))
+        rt = np.asarray(getattr(tree.leaf_uq, field))
+        np.testing.assert_allclose(orig, rt, atol=1e-12, equal_nan=True)
+
+
+def test_json_roundtrip_with_nan_in_leaf_mse(branin_2d) -> None:
+    """P4/Phase 4 item 12: a NaN in a UQ array must round-trip via
+    null-encoding (allow_nan=False would otherwise raise on it)."""
+    import dataclasses
+
+    from jax_ldt._types import LeafUQ
+
+    X, y = branin_2d
+    model = LinearTreeRegressor(max_depth=3, max_bins=6, min_samples_leaf=15).fit(X, y)
+    tree = model.tree_
+    mse = np.asarray(tree.leaf_uq.mse).copy()
+    mse[0] = np.nan  # corrupt one entry
+    import jax.numpy as jnp
+
+    new_uq = dataclasses.replace(tree.leaf_uq, mse=jnp.asarray(mse))
+    tree2 = dataclasses.replace(tree, leaf_uq=new_uq)
+    s = to_json(tree2)  # must not raise despite the NaN
+    assert "null" in s
+    rt = from_json(s)
+    assert np.isnan(np.asarray(rt.leaf_uq.mse)[0])
