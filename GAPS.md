@@ -21,6 +21,62 @@ For the list of items already resolved by prior work, see the
 
 ---
 
+## 2026-07 remediation pass (review-driven)
+
+A full-codebase review (correctness / thoroughness / performance) drove
+a large remediation pass. Each item below was reproduced, fixed, and
+pinned with a regression test. Summary:
+
+**High (silent wrong answers):**
+- **H1/H2.** `linear_features` is now actually applied (excluded columns
+  zeroed in the fitting design matrix → exactly-zero coefficients);
+  categorical columns no longer get leaf coefficients. See the G-17 note
+  below.
+- **H3.** JAX x64 is enforced at every public `fit`/`predict`/`calibrate`
+  /export boundary (`_require_x64`); without it float64 was silently
+  demoted to float32. README/SKILL updated.
+- **H4.** `rmse`/`max_abs` split selection now evaluates the combined
+  piecewise prediction over the node (upstream convention); the old
+  sample-weighted average was wrong for these criteria. `mae`/`msle`
+  unchanged.
+- **H5.** discopt `big_m` is a genuine big-M constant (was misused as a
+  feature-box half-width), validated against derived bounds.
+
+**Medium:** M1 optional strict MIP boundary (`boundary_eps`); M2 ±1e20
+sentinel guard; M3 conformal small-leaf clip warning + alpha-derived
+`min_calibration_per_leaf`; M4 empty-calibration raise; M5 stale-model
+guard; M6 QuadraticUQ global-σ fallback for sparse/underdetermined
+leaves; M7 pool-mode dedup; M8 `tell` index validation; M9
+DiverseBatchSelector uniqueness/seed; M10 GreedyMaxMin `scale`; M11
+sklearn NotFittedError + uniform-average R² + HT wrapper; M12 dedup
+warning only on rounding collapse; M13 `do_symmetrize=False` oblique
+rows kept; M14 calibration-band x-axis; M15 ONNX `ir_version` +
+opset guard.
+
+**Performance:** P1 split-kernel candidate chunking (`lax.map`) to bound
+peak memory; P2 hoisted `X_split` + deferred per-leaf sync (the leaf-fit
+JIT was **reverted** — XLA float reordering perturbed leaf params and
+flipped discopt's fragile solver; leaf fits are cheap, so eager wins on
+reproducibility); P3 JIT `predict`/`apply`; P4 vectorized JSON NaN
+codec + `allow_nan=False`; P5 device-side finite check; P6 QuadraticUQ
+fits only leaves.
+
+**Design decisions worth knowing:**
+- **linprop `mode=`.** `linprop_uncertainty` keeps the historical
+  epistemic formula as `mode="upstream"` (default, unchanged numbers)
+  and adds `mode="prediction"` (a proper predictive std with the
+  irreducible-noise term and unbiased residual variance
+  `s² = SSR/max(n−p,1)`). Feed `calibration_metrics` the prediction
+  mode. The upstream leverage term is dimensionally inconsistent (not
+  scaled by residual variance) — preserved for back-compat but noted.
+- **`ridge` is absolute** (not scale-invariant): standardize features at
+  scale ≳ 1e6. A relative-ridge option is deferred, not silently applied.
+- **P1 reproducibility.** `lax.map` chunking is per-candidate
+  numerically equivalent (~1e-14) but can flip an exact-tie split; leaf
+  fits are kept eager to preserve reproducible leaf coefficients.
+
+---
+
 ## Medium — undocumented mismatches, missing test paths, footguns
 
 ### G-19 (residual). Planned API surfaces still not delivered
