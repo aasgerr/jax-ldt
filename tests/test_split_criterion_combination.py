@@ -110,31 +110,3 @@ def test_maxabs_picks_lower_max_split() -> None:
     thr = np.asarray(model.tree_.threshold)
     root_thr = thr[~is_leaf][0]
     assert abs(root_thr) < 0.2, f"root split at {root_thr}, expected near 0"
-
-
-def test_chunking_is_exact(monkeypatch) -> None:
-    """P1: chunking the candidate axis (lax.map batch_size) must produce
-    the same split evaluation as an all-at-once pass, to float tolerance."""
-    import jax
-    import jax_ldt.tree_core as tc
-    from jax_ldt.linear_regression import add_bias
-
-    rng = np.random.default_rng(7)
-    N = 220
-    X = rng.uniform(-1, 1, size=(N, 3))
-    y = (X[:, 0] ** 2 + X[:, 1])[:, None]
-    X_aug = add_bias(jnp.asarray(X))
-    node_mask = jnp.ones(N)
-    X_split = jnp.asarray(X)
-    thr = _compute_thresholds(X, max_bins=8)
-
-    args = (X_aug, jnp.asarray(y), node_mask, X_split, thr, 1e-5, 3.0, "max_abs")
-    o_natural, tb_natural, *_ = _evaluate_splits(*args)
-
-    # Force maximal chunking (block=1) and rebuild the jitted kernel.
-    monkeypatch.setattr(tc, "_pick_block_size", lambda *a: 1)
-    ev_chunked = jax.jit(tc._evaluate_splits_kernel, static_argnames=("loss_name",))
-    o_chunked, tb_chunked, *_ = ev_chunked(*args)
-
-    np.testing.assert_allclose(np.asarray(o_natural), np.asarray(o_chunked), atol=1e-9)
-    np.testing.assert_allclose(np.asarray(tb_natural), np.asarray(tb_chunked), atol=1e-9)

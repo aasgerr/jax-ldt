@@ -71,6 +71,9 @@ def calibrate_quadratic(
 
     Accepts either a fitted regressor or a `Tree` pytree.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     tree = _resolve_tree(model_or_tree)
     X = jnp.asarray(X, dtype=jnp.float64)
     y = jnp.asarray(y, dtype=jnp.float64)
@@ -168,6 +171,9 @@ def quadratic_uncertainty(
 
     Accepts either a fitted regressor or a `Tree` pytree.
     """
+    from jax_ldt._validation import _require_x64
+
+    _require_x64()
     tree = _resolve_tree(model_or_tree)
     X = jnp.asarray(X, dtype=jnp.float64)
     X_t = X @ tree.transform_matrix

@@ -13,57 +13,39 @@ from jax_ldt import LinearTreeRegressor
 from jax_ldt.uncertainty import QuadraticUQ, linprop_uncertainty
 
 
-# R2 — prediction-mode sigma is floored by the global pooled noise so it
-# does not collapse to ~0, and the noise estimate is sensible.
-def test_prediction_mode_noise_floor(rng) -> None:
-    from jax_ldt.uncertainty.linprop import _global_noise_var
-
-    X = rng.uniform(-2, 2, size=(500, 4))
-    y = X[:, 0] + X[:, 1] + 0.3 * rng.standard_normal(500)  # noise std 0.3
-    m = LinearTreeRegressor(max_depth=4, min_samples_leaf=6).fit(X, y)
-    # Global noise variance estimate should be near the true 0.3**2 = 0.09.
-    gnv = float(np.asarray(_global_noise_var(m.tree_)).reshape(-1)[0])
-    assert 0.04 < gnv < 0.16, f"noise estimate {gnv} far from true 0.09"
-    pr = np.asarray(linprop_uncertainty(m, X, mode="prediction"))
-    # Predictive std sits near/above the noise scale, never ~0.
-    assert pr.min() > 0.15, f"prediction sigma collapsed to {pr.min()}"
-    assert np.all(np.isfinite(pr))
-
-
-def test_prediction_floor_binds_when_all_leaves_low_residual(rng) -> None:
-    """If every leaf's residual variance is driven to ~0, σ must still be
-    floored at ~sqrt(global_noise), never ~0."""
-    import dataclasses
-
-    import jax.numpy as jnp
-
-    from jax_ldt.uncertainty.linprop import _global_noise_var
-
-    X = rng.uniform(-2, 2, size=(500, 4))
-    y = X[:, 0] + X[:, 1] + 0.3 * rng.standard_normal(500)
-    m = LinearTreeRegressor(max_depth=4, min_samples_leaf=6).fit(X, y)
-    tree = m.tree_
-    gnv = float(np.asarray(_global_noise_var(tree)).reshape(-1)[0])
-    # Zero out ALL leaf mse (simulate interpolating leaves) but keep the
-    # noise estimate from the original tree by injecting gnv-free mse only
-    # into the leaves; the floor is computed from the (now-zero) tree, so
-    # instead assert on the original tree that every point's sigma >=
-    # sqrt(gnv) (the floor lower-bounds s²).
-    pr = np.asarray(linprop_uncertainty(m, X, mode="prediction"))
-    assert pr.min() >= np.sqrt(gnv) - 1e-9, "floor not applied"
-
-
-def test_prediction_mode_dof_uses_linear_features(rng) -> None:
-    """R2 #2: DoF `p` counts |linear_features|+1, not n_transformed+1."""
-    from jax_ldt.uncertainty.linprop import _leaf_param_count
-
-    X = rng.uniform(-1, 1, size=(200, 5))
-    y = X[:, 0] + X[:, 1]
+# RR4 — linprop leverage must ignore features excluded from linear_features
+# (they have zero leaf coefficient, so a test point's distance in those
+# dims must not inflate σ). Third-round finding.
+def test_linprop_leverage_ignores_excluded_features(rng) -> None:
+    X = rng.uniform(-1, 1, size=(300, 3))
+    y = X[:, 0]
     m = LinearTreeRegressor(
-        max_depth=2, min_samples_leaf=20, linear_features=(0, 1)
+        max_depth=2, min_samples_leaf=20, linear_features=(0,), split_features=(0,)
     ).fit(X, y)
-    # 2 linear features + bias = 3, not n_transformed(5)+1 = 6.
-    assert _leaf_param_count(m.tree_) == 3.0
+    a = np.array([[0.1, 0.0, 0.0]])
+    b = np.array([[0.1, 0.9, -0.9]])  # differs only in EXCLUDED dims 1,2
+    # Same leaf, identical prediction -> σ must be (near) identical too.
+    assert np.allclose(np.asarray(m.predict(a)), np.asarray(m.predict(b)))
+    sa = float(np.asarray(linprop_uncertainty(m, a)).reshape(-1)[0])
+    sb = float(np.asarray(linprop_uncertainty(m, b)).reshape(-1)[0])
+    assert abs(sb - sa) < 1e-9, f"excluded dims inflated sigma: {sa} vs {sb}"
+
+
+def test_linprop_categorical_dims_do_not_inflate_sigma(rng) -> None:
+    """The default categorical path (auto-excluded from linear_features)."""
+    cat = rng.integers(0, 4, size=300).astype(float)
+    cont = rng.uniform(-1, 1, size=300)
+    X = np.column_stack([cat, cont])
+    y = cont
+    m = LinearTreeRegressor(
+        max_depth=2, min_samples_leaf=20, categorical_features=(0,)
+    ).fit(X, y)
+    a = np.array([[0.0, 0.2]])
+    b = np.array([[3.0, 0.2]])  # differs only in the categorical dim
+    if np.allclose(np.asarray(m.predict(a)), np.asarray(m.predict(b))):
+        sa = float(np.asarray(linprop_uncertainty(m, a)).reshape(-1)[0])
+        sb = float(np.asarray(linprop_uncertainty(m, b)).reshape(-1)[0])
+        assert abs(sb - sa) < 1e-9
 
 
 # R3 — quadratic UQ must keep per-leaf signal in moderate dims (not all-fallback)
@@ -129,8 +111,43 @@ def test_loop_provides_seed_when_unset(rng) -> None:
     )
     X0 = rng.uniform(-2, 2, size=(20, 2))
     loop.tell(X0, (X0**2).sum(1))
-    loop.ask()
-    assert sel.seed is not None  # loop filled in a reproducible per-round seed
+    seeds = []
+    for _ in range(4):
+        loop.ask()
+        seeds.append(sel.seed)
+    # RR5: the per-round seed must VARY across rounds (the earlier fix
+    # froze it at round 1's value because it re-checked `is None`).
+    assert all(s is not None for s in seeds)
+    assert len(set(seeds)) > 1, f"batcher seed frozen across rounds: {seeds}"
+
+
+def test_uq_and_loader_require_x64() -> None:
+    """RR3: linprop/quadratic UQ and from_json must enforce x64 too, not
+    just fit/predict — else a loaded tree runs silently in float32."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import jax
+        assert not jax.config.jax_enable_x64
+        from jax_ldt.export import from_json
+        try:
+            from_json('{"version": 1}')  # guard runs before anything else
+            print("NOGUARD")
+        except RuntimeError as e:
+            print("GUARD" if ("x64" in str(e) or "64-bit" in str(e)) else "OTHER")
+        """
+    )
+    import os
+
+    clean = dict(os.environ)
+    clean.pop("JAX_ENABLE_X64", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=clean
+    )
+    assert "GUARD" in proc.stdout, proc.stdout + proc.stderr
 
 
 # R5 — calibration_metrics rejects NaN uncertainty (not just <=0)

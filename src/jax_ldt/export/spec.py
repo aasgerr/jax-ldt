@@ -135,6 +135,11 @@ def _nan_for_none_array(nested: Any) -> np.ndarray:
 
 def tree_from_dict(d: dict[str, Any]) -> Tree:
     """Rebuild a Tree from a JSON-compatible dict."""
+    from jax_ldt._validation import _require_x64
+
+    # The reconstructed arrays are float64; without x64 they silently
+    # demote to float32, corrupting a model that was saved in 64-bit.
+    _require_x64()
     if d.get("version") != SPEC_VERSION:
         raise ValueError(f"Unsupported spec version: {d.get('version')}")
     t = d["tree"]

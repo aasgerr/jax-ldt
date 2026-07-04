@@ -85,6 +85,11 @@ class ActiveLearner:
         self.model_factory = model_factory
         self.acquisition = acquisition
         self.batcher = batcher
+        # Whether the batcher arrived with a user-set seed. Recorded ONCE
+        # here: after the first ask() fills in a per-round seed, the field
+        # is no longer None, so re-checking `is None` each round would
+        # freeze it. If the user set a seed, we never override it.
+        self._batcher_seed_user_set = getattr(batcher, "seed", None) is not None
         self.bounds = np.asarray(bounds, dtype=np.float64)
         if self.bounds.ndim != 2 or self.bounds.shape[1] != 2:
             raise ValueError("bounds must have shape (n_features, 2)")
@@ -227,14 +232,13 @@ class ActiveLearner:
         scores = np.asarray(self.acquisition.score(self.model, jnp.asarray(candidates)))
 
         # Give a seed-aware batcher (e.g. DiverseBatchSelector) that has NO
-        # seed of its own a reproducible per-round seed derived from the
+        # user-set seed a reproducible per-round seed derived from the
         # loop's fold-in RNG, so k-means++ seeding varies across rounds yet
-        # survives save/load. If the user set an explicit seed on their
-        # selector, respect it (don't clobber it). We consume an RNG key
-        # either way so the candidate/seed stream stays deterministic
-        # regardless of which branch runs.
+        # survives save/load. If the user set an explicit seed, respect it.
+        # We consume an RNG key either way so the candidate/seed stream
+        # stays deterministic regardless of which branch runs.
         _round_seed = int(jax.random.randint(self._next_rng_key(), (), 0, 2**31 - 1))
-        if getattr(self.batcher, "seed", "no-seed-attr") is None:
+        if hasattr(self.batcher, "seed") and not self._batcher_seed_user_set:
             self.batcher.seed = _round_seed
         idx = self.batcher.select(candidates, scores, self.batch_size)
         X_batch = candidates[idx]

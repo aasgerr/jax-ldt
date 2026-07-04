@@ -95,18 +95,13 @@ def test_calibration_metrics_nonpositive_uncertainty_raises() -> None:
         calibration_metrics(np.zeros(10), np.zeros(10), np.zeros(10))
 
 
-# item 14 — linprop prediction mode
-def test_linprop_prediction_mode_nonzero(rng) -> None:
+# linprop is epistemic-only; the unsound prediction mode was removed.
+def test_linprop_is_epistemic_and_finite(rng) -> None:
     X = rng.uniform(-2, 2, size=(400, 1))
     y = np.sin(X[:, 0]) + 0.3 * rng.standard_normal(400)
     model = LinearTreeRegressor(max_depth=3, min_samples_leaf=20).fit(X, y)
-    up = np.asarray(LinearPropagationUQ().predict(model.tree_, X))
-    pr = np.asarray(LinearPropagationUQ().predict(model.tree_, X, mode="prediction"))
-    # Prediction std adds the irreducible-noise term, so it does NOT
-    # collapse toward 0 at leaf centres the way upstream does: its floor
-    # is much higher and its mean sits near the true 0.3 noise scale.
-    assert pr.min() > 5 * up.min()
-    assert pr.mean() > up.mean()
-    assert pr.min() > 0.1  # near the noise floor, not ~0
-    with pytest.raises(ValueError, match="mode must be"):
-        LinearPropagationUQ().predict(model.tree_, X, mode="bad")
+    sig = np.asarray(LinearPropagationUQ().predict(model.tree_, X))
+    assert np.all(sig >= 0.0) and np.all(np.isfinite(sig))
+    # The `mode=` kwarg no longer exists (removed as statistically unsound).
+    with pytest.raises(TypeError):
+        LinearPropagationUQ().predict(model.tree_, X, mode="prediction")

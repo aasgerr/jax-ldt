@@ -62,18 +62,31 @@ codec + `allow_nan=False`; P5 device-side finite check; P6 QuadraticUQ
 fits only leaves.
 
 **Design decisions worth knowing:**
-- **linprop `mode=`.** `linprop_uncertainty` keeps the historical
-  epistemic formula as `mode="upstream"` (default, unchanged numbers)
-  and adds `mode="prediction"` (a proper predictive std with the
-  irreducible-noise term and unbiased residual variance
-  `s² = SSR/max(n−p,1)`). Feed `calibration_metrics` the prediction
-  mode. The upstream leverage term is dimensionally inconsistent (not
-  scaled by residual variance) — preserved for back-compat but noted.
+- **linprop is epistemic-only.** `linprop_uncertainty` is the faithful
+  epistemic (fitted-mean) port. A `mode="prediction"` predictive std was
+  attempted but **removed** (third review): a parametric predictive std
+  can't be estimated reliably from a tree's own leaf residuals —
+  interpolating / over-parameterized leaves (the norm for hyperplane
+  trees) have ~0 residual, and trees create heteroscedastic leaves, so a
+  global noise floor is both incoherent (it leaks into the leverage term)
+  and vanishes for HT. For predictive intervals use conformal. The
+  leverage sum is now restricted to the leaf's `linear_features` (H1:
+  excluded/categorical dims have zero coefficient and must not inflate σ).
 - **`ridge` is absolute** (not scale-invariant): standardize features at
   scale ≳ 1e6. A relative-ridge option is deferred, not silently applied.
-- **P1 reproducibility.** `lax.map` chunking is per-candidate
-  numerically equivalent (~1e-14) but can flip an exact-tie split; leaf
-  fits are kept eager to preserve reproducible leaf coefficients.
+- **P1 was reverted.** The `lax.map` candidate-chunking optimization was
+  removed (third review): it ran ~2.3× slower than the fused vmap on deep
+  hyperplane trees (scan compile/overhead) and, being only per-candidate
+  numerically equivalent (~1e-14), could flip an exact-tie split and
+  change the tree. The split kernel is back to the fused vmap+einsum. The
+  O(K·B·N·T) peak-memory concern it targeted is a known limitation at
+  extreme sizes (e.g. 200k rows × 50 split features × 24 bins); chunk the
+  data or reduce `max_bins`/`num_terms` there.
+- **x64 enforced everywhere.** `_require_x64` guards not just fit/predict
+  but every UQ (`linprop_uncertainty`, `quadratic_uncertainty`,
+  `calibrate_quadratic`, `ConformalCalibrator.calibrate/predict_interval`)
+  and loader (`from_json`) entry point, so a tree can't silently run in
+  float32 after being loaded in an x64-off process.
 
 ---
 

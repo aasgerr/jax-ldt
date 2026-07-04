@@ -266,6 +266,9 @@ class ConformalCalibrator:
         (all targets covered simultaneously) has coverage roughly
         ``(1 - alpha)^T`` for independent residuals — lower than nominal.
         """
+        from jax_ldt._validation import _require_x64
+
+        _require_x64()
         if self.state_ is None or self._tree is None:
             raise RuntimeError("Call calibrate(...) first.")
         tree = self._tree

@@ -12,30 +12,23 @@ variance `σ²`, and leaf MSE `m`:
 
 The first term is the leaf's residual variance scaled by sample count
 (epistemic); the second grows with distance from the leaf's training
-mean (extrapolation penalty). Cheap, no calibration step required.
+mean (extrapolation penalty), summed only over the features the leaf
+model actually uses (`linear_features`). Cheap, no calibration step
+required.
 
 ```python
 from jax_ldt import LinearPropagationUQ
 sigma = LinearPropagationUQ().predict(model.tree_, X)
 ```
 
-**Modes.** The default `mode="upstream"` (shown above) is the historical
-port: it is the epistemic variance of the *fitted mean*, so σ collapses
-toward 0 at leaf centres and is **not** a predictive std. When you need a
-predictive std — e.g. to feed `calibration_metrics` — use
-`mode="prediction"`, which adds the irreducible-noise term and uses the
-residual variance `s²` (the per-leaf `SSR/max(n−p, 1)`, **floored by the
-global pooled residual variance** so interpolating/small leaves don't
-report ~0 uncertainty):
-
-    σ_pred(x) = sqrt( s² · (1 + 1/n + Σⱼ (xⱼ − μⱼ)² / ((n−1) σⱼ²)) )
-
-```python
-sigma_pred = LinearPropagationUQ().predict(model.tree_, X, mode="prediction")
-```
-
-The default is kept as `"upstream"` so existing acquisition behaviour and
-saved-model numbers do not change silently.
+This is an **epistemic** (fitted-mean) std — it collapses toward 0 at
+leaf centres and does **not** include irreducible noise, so it is not a
+calibrated predictive std. For a **predictive interval** with a
+finite-sample coverage guarantee, use conformal prediction (below); a
+parametric predictive std cannot be estimated reliably from a tree's own
+leaf residuals (interpolating / over-parameterized leaves — the norm for
+hyperplane trees — have ~0 residual, and trees deliberately create
+heteroscedastic leaves).
 
 ## Quadratic-difference UQ
 
