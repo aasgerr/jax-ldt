@@ -54,3 +54,45 @@ def test_fallback_state_marks_uncovered_leaves(rng) -> None:
     assert fb.any()
     # Global sigma is finite and non-negative.
     assert np.all(np.asarray(quq.state_.global_sigma) >= 0.0)
+
+
+def test_quadratic_features_matches_outer_product_form(rng):
+    """P6: the triu-product form must equal the old (N,F,F) outer-product
+    gather exactly."""
+    import jax.numpy as jnp
+    from jax_ldt.uncertainty.quadratic import _quadratic_features
+
+    X_aug = jnp.asarray(rng.uniform(-1, 1, size=(20, 5)))
+    got = np.asarray(_quadratic_features(X_aug))
+    F = X_aug.shape[1]
+    outer = np.asarray(X_aug)[:, :, None] * np.asarray(X_aug)[:, None, :]
+    iu, ju = np.triu_indices(F)
+    ref = outer[:, iu, ju]
+    np.testing.assert_allclose(got, ref, atol=1e-12)
+
+
+def test_quadratic_leaf_params_match_direct_fit(rng):
+    """P6: fitting only leaves then scattering must give the same per-leaf
+    quadratic params as a direct ridge fit on that leaf's points."""
+    import jax.numpy as jnp
+
+    from jax_ldt import LinearTreeRegressor
+    from jax_ldt.linear_regression import add_bias, fit_ridge
+    from jax_ldt.uncertainty.quadratic import _quadratic_features, calibrate_quadratic
+
+    X = rng.uniform(-1, 1, size=(300, 2))
+    y = X[:, 0] ** 2 + X[:, 1]
+    model = LinearTreeRegressor(max_depth=3, min_samples_leaf=30).fit(X, y)
+    state = calibrate_quadratic(model.tree_, X, y, ridge=1e-5)
+
+    tree = model.tree_
+    leaf_ids = np.asarray(model.apply(X))
+    X_quad = np.asarray(_quadratic_features(add_bias(jnp.asarray(X) @ tree.transform_matrix)))
+    is_leaf = np.asarray(tree.is_leaf)
+    qp = np.asarray(state.leaf_quad_params)
+    for nid in np.where(is_leaf)[0]:
+        idx = leaf_ids == nid
+        if idx.sum() == 0:
+            continue
+        ref = np.asarray(fit_ridge(jnp.asarray(X_quad[idx]), jnp.asarray(y[idx]), 1e-5))
+        np.testing.assert_allclose(qp[nid], ref, atol=1e-8)

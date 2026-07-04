@@ -35,12 +35,11 @@ def _quadratic_features(X_aug: jnp.ndarray) -> jnp.ndarray:
     linear model is a strict subspace of this feature set.
     """
     N, F = X_aug.shape
-    # outer products: (N, F, F)
-    outer = X_aug[:, :, None] * X_aug[:, None, :]
-    # take the upper triangle (including diagonal). Skip [0,0] since it's just 1.
+    # Upper-triangle (incl. diagonal) cross-products, formed directly as
+    # X[:, i] * X[:, j] for i <= j — avoids materialising the full
+    # (N, F, F) outer product just to gather half of it.
     iu, ju = jnp.triu_indices(F)
-    cross = outer[:, iu, ju]  # (N, F*(F+1)/2)
-    return cross  # already includes the bias-squared term at index 0 (== 1)
+    return X_aug[:, iu] * X_aug[:, ju]  # (N, F*(F+1)/2)
 
 
 @dataclass
@@ -93,19 +92,19 @@ def calibrate_quadratic(
     # zero-init invariant that downstream code relies on).
     is_leaf_np = np.asarray(tree.is_leaf)
     leaf_node_ids = np.where(is_leaf_np)[0]
-    masks_np = np.zeros((n_nodes, X_quad.shape[0]), dtype=np.float64)
+
+    # Fit ONLY the leaves. The previous version built a dense (n_nodes, N)
+    # mask and vmapped the ridge fit over every node — half the solves
+    # (internal nodes) were pure waste that got zeroed afterward, and the
+    # mask doubled the memory. We fit the (n_leaves, N) membership masks
+    # and scatter the results back into the (n_nodes, ...) array, leaving
+    # internal nodes at zero (the contract downstream relies on).
+    quad_params = jnp.zeros((n_nodes, n_quad, T), dtype=jnp.float64)
     if leaf_node_ids.size > 0:
         membership = (leaf_ids[None, :] == leaf_node_ids[:, None]).astype(np.float64)
-        masks_np[leaf_node_ids] = membership
-    masks = jnp.asarray(masks_np)
-
-    # One vmapped JIT call instead of `n_nodes` Python-loop fits with
-    # per-iteration host syncs. Non-leaf rows fit to zero coefficients
-    # under the ridge prior; we explicitly zero them again to preserve
-    # the public contract that non-leaf nodes have zero quad params.
-    fitted = _fit_many_sides(X_quad, y, masks, ridge)  # (n_nodes, n_quad, T)
-    keep = jnp.asarray(is_leaf_np[:, None, None].astype(np.float64))
-    quad_params = fitted * keep
+        leaf_masks = jnp.asarray(membership)  # (n_leaves, N)
+        fitted_leaves = _fit_many_sides(X_quad, y, leaf_masks, ridge)  # (n_leaves, n_quad, T)
+        quad_params = quad_params.at[jnp.asarray(leaf_node_ids)].set(fitted_leaves)
 
     # Flag leaves whose quadratic refit is unreliable: zero calibration
     # points (→ σ would be |lin - 0| = |prediction|, pure garbage) or
