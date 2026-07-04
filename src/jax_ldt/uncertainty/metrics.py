@@ -47,13 +47,15 @@ def calibration_metrics(
     y_pred = y_pred.reshape(-1)
     uncertainty = uncertainty.reshape(-1)
     y_true = y_true.reshape(-1)
-    # utb's NLL / calibration divide by the std, so a non-positive
-    # uncertainty (linprop can legitimately return exact 0) blows up.
-    if np.any(uncertainty <= 0.0):
+    # utb's NLL / calibration divide by the std, so a non-positive OR
+    # non-finite uncertainty blows up. `~(u > 0)` catches <=0 AND NaN
+    # (NaN > 0 is False), and we also reject +inf explicitly.
+    if np.any(~(uncertainty > 0.0)) or np.any(~np.isfinite(uncertainty)):
         raise ValueError(
-            "calibration_metrics requires strictly positive uncertainty "
-            "(uncertainty-toolbox divides by the std). Got a value <= 0; "
-            "clamp with a small floor or use a predictive-variance UQ mode."
+            "calibration_metrics requires strictly positive, finite "
+            "uncertainty (uncertainty-toolbox divides by the std). Got a "
+            "value <= 0, NaN, or inf; clamp with a small floor or use a "
+            "predictive-variance UQ mode."
         )
 
     metrics: dict[str, Any] = {}

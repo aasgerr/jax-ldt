@@ -43,7 +43,43 @@ def _resolve_tree(model_or_tree) -> Tree:
     return tree
 
 
-def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray, mode: str) -> jnp.ndarray:
+def _leaf_param_count(tree: Tree) -> float:
+    """Number of free leaf-model parameters = |linear_features| + bias.
+
+    With `linear_features` restriction (H1) the excluded columns have
+    exactly-zero coefficients, so the effective DoF is the size of the
+    linear set plus the intercept — not `n_features_transformed + 1`.
+    """
+    return float(len(tree.linear_features)) + 1.0
+
+
+def _global_noise_var(tree: Tree) -> jnp.ndarray:
+    """Pooled residual variance across *informative* leaves, ``(n_targets,)``.
+
+    Estimated as ``Σ SSR / Σ (n − p)`` over leaves with residual degrees of
+    freedom (``n > p``); interpolating leaves (``n ≤ p``) carry no noise
+    information and are excluded. Used as an irreducible-noise FLOOR in
+    prediction mode so σ does not collapse to ~0 on small/interpolating
+    leaves whose own ``mse`` is ~0.
+
+    Caveat: if the tree is fully over-parameterized (EVERY leaf has
+    ``n ≤ p``, e.g. a very deep tree on few samples), there are no
+    informative leaves, the estimate is 0, and no floor can be provided —
+    the residuals genuinely carry no noise signal in that regime.
+    """
+    uq = tree.leaf_uq
+    n = uq.n.astype(jnp.float64)  # (n_nodes,)
+    p = _leaf_param_count(tree)
+    informative = (tree.is_leaf & (n > p)).astype(jnp.float64)  # (n_nodes,)
+    ssr_per_leaf = uq.mse * n[:, None]  # (n_nodes, T)  (mse = SSR/n)
+    total_ssr = jnp.sum(ssr_per_leaf * informative[:, None], axis=0)  # (T,)
+    total_dof = jnp.sum((n - p) * informative)  # scalar
+    return jnp.where(total_dof > 0.0, total_ssr / jnp.maximum(total_dof, 1.0), 0.0)
+
+
+def _per_sample_uncertainty(
+    tree: Tree, x_in: jnp.ndarray, mode: str, global_noise_var: jnp.ndarray
+) -> jnp.ndarray:
     """Compute σ_pred for one sample (shape: (n_features_in,)).
 
     ``mode``:
@@ -53,12 +89,15 @@ def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray, mode: str) -> jnp.nda
       the variance of the fitted *mean* (epistemic only) and is what the
       acquisition functions have always consumed; kept as the default so
       numbers do not change silently.
-    * ``"prediction"``: a proper predictive std
-      ``σ² = s²·(1 + 1/n + Σ(x−μ)²/((n−1)σ_x²))`` with the unbiased
-      residual variance ``s² = SSR/max(n−p, 1)`` (``p =
-      n_features_transformed + 1``). The ``+1`` adds the irreducible
-      noise term, so σ does not collapse to 0 at leaf centres and the
-      value is appropriate to feed to ``calibration_metrics`` as a
+    * ``"prediction"``: a predictive std
+      ``σ² = s²·(1 + 1/n + Σ(x−μ)²/((n−1)σ_x²))`` where the residual
+      variance ``s²`` is the per-leaf ``SSR/max(n−p, 1)`` *floored* by the
+      global pooled residual variance (``global_noise_var``). The floor
+      matters: a leaf's own ``mse`` is ~0 when it interpolates its few
+      points (``n ≤ p`` or a smooth region), which would otherwise
+      collapse σ→~0 precisely on the least-trustworthy leaves. Flooring by
+      the global noise keeps σ at a sensible irreducible-noise level, so
+      the value is appropriate to feed to ``calibration_metrics`` as a
       Gaussian predictive std.
 
     Edge cases:
@@ -115,12 +154,12 @@ def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray, mode: str) -> jnp.nda
 
     if mode == "prediction":
         # Unbiased residual variance s² = SSR/(n-p); the stored mse is
-        # SSR/n, so s² = mse·n/(n-p). Predictive variance adds the
-        # irreducible-noise term (the leading 1).
-        p = float(tree.n_features_transformed) + 1.0
+        # SSR/n, so s² = mse·n/(n-p). Floor by the global pooled noise so
+        # interpolating leaves (mse≈0) don't report ~0 uncertainty.
+        p = _leaf_param_count(tree)
         ssr = mse * n  # (n_targets,)
         denom_df = jnp.where(n > p, n - p, 1.0)
-        s_sq = ssr / denom_df
+        s_sq = jnp.maximum(ssr / denom_df, global_noise_var)  # (n_targets,)
         sigma_sq = s_sq * (1.0 + 1.0 / safe_n + deviation)
     else:  # "upstream" (default)
         sigma_sq = base + deviation  # broadcast: (n_targets,)
@@ -138,8 +177,12 @@ def linprop_uncertainty(model_or_tree, X: jnp.ndarray, *, mode: str = "upstream"
     if mode not in ("upstream", "prediction"):
         raise ValueError(f"mode must be 'upstream' or 'prediction'; got {mode!r}")
     tree = _resolve_tree(model_or_tree)
+    if tree.leaf_uq is None:
+        raise RuntimeError("Tree has no leaf UQ; refit model.")
     X = jnp.asarray(X, dtype=jnp.float64)
-    out = jax.vmap(lambda x: _per_sample_uncertainty(tree, x, mode))(X)  # (N, T)
+    # Global noise floor computed once (only used in prediction mode).
+    gnv = _global_noise_var(tree) if mode == "prediction" else jnp.zeros(tree.n_targets)
+    out = jax.vmap(lambda x: _per_sample_uncertainty(tree, x, mode, gnv))(X)  # (N, T)
     if tree.n_targets == 1:
         out = out[:, 0]
     return out

@@ -17,7 +17,6 @@ import textwrap
 def _run_without_x64(body: str) -> subprocess.CompletedProcess:
     """Run ``body`` in a subprocess with JAX_ENABLE_X64 unset."""
     script = textwrap.dedent(body)
-    env = {"PATH": "/usr/bin:/bin"}
     # Inherit the venv's site-packages by reusing the current executable
     # but scrub any x64-enabling env var.
     import os

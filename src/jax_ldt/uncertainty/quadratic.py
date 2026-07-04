@@ -46,12 +46,14 @@ def _quadratic_features(X_aug: jnp.ndarray) -> jnp.ndarray:
 class QuadraticUQState:
     """Pre-computed quadratic params per leaf.
 
-    ``leaf_is_fallback`` marks leaves whose quadratic refit is
-    unreliable (zero calibration points, or fewer than the number of
-    quadratic features → underdetermined). For test points routed
+    ``leaf_is_fallback`` marks leaves that received ZERO calibration
+    points (their quad params are exactly 0, so a per-leaf σ would be the
+    garbage ``|linear - 0| = |prediction|``). For test points routed
     there, ``quadratic_uncertainty`` returns ``global_sigma`` (the mean
-    ``|linear - quadratic|`` over well-fit calibration points) instead of
-    the garbage ``|linear - 0|`` a zeroed refit would produce.
+    ``|linear - quadratic|`` over non-empty calibration leaves) instead.
+    Leaves with few (< n_quad) points are underdetermined but keep their
+    per-leaf estimate — with the ridge prior it stays a reasonable,
+    non-exploding signal for realistic leaf sizes; it is simply noisier.
     """
 
     leaf_quad_params: jnp.ndarray  # (n_nodes, n_quad_features, n_targets)
@@ -106,20 +108,24 @@ def calibrate_quadratic(
         fitted_leaves = _fit_many_sides(X_quad, y, leaf_masks, ridge)  # (n_leaves, n_quad, T)
         quad_params = quad_params.at[jnp.asarray(leaf_node_ids)].set(fitted_leaves)
 
-    # Flag leaves whose quadratic refit is unreliable: zero calibration
-    # points (→ σ would be |lin - 0| = |prediction|, pure garbage) or
-    # fewer points than quadratic features (→ underdetermined, near
-    # interpolation, |lin - quad| explodes). Such leaves fall back to a
-    # global σ at predict time.
+    # Flag ONLY leaves with ZERO calibration points as fallback: their
+    # quad params are exactly 0, so σ = |lin - 0| = |prediction| — pure
+    # garbage on the prediction scale. Leaves with few (< n_quad) points
+    # are underdetermined but, with the ridge prior and realistic leaf
+    # sizes, still produce a reasonable, non-exploding |lin - quad| signal
+    # (verified: on a 10-D tree with n_quad=66 and ~25 cal pts/leaf, σ
+    # spans 8e-4..0.39, well within the y scale) — so we KEEP those
+    # estimates rather than collapsing every moderate-dim leaf to a
+    # useless constant.
     counts = np.zeros(n_nodes, dtype=np.int64)
     if leaf_ids.size > 0:
         binc = np.bincount(leaf_ids, minlength=n_nodes)
         counts[: binc.shape[0]] = binc
-    fallback_np = is_leaf_np & (counts < n_quad)
+    fallback_np = is_leaf_np & (counts == 0)
 
     # Global σ = mean |lin - quad| over calibration points routed to
-    # well-fit leaves. Fall back to the mean over all points if every
-    # leaf is a fallback (tiny calibration set).
+    # well-fit (non-empty) leaves. Fall back to the mean over all points
+    # only if every leaf is empty (i.e. no calibration data at all).
     lin_params_cal = np.asarray(tree.leaf_params)[leaf_ids]  # (N, n_aug, T)
     yh_lin_cal = np.einsum("nf,nft->nt", np.asarray(X_aug), lin_params_cal)
     yh_quad_cal = np.einsum(
@@ -140,11 +146,10 @@ def calibrate_quadratic(
         preview = fb_ids[:10].tolist()
         more = "" if fb_ids.size <= 10 else f" (+{fb_ids.size - 10} more)"
         warnings.warn(
-            f"{n_fallback} leaves had fewer than n_quad={n_quad} calibration "
-            f"points (quadratic refit underdetermined or absent); "
-            f"quadratic_uncertainty falls back to the global mean sigma there "
-            f"(leaf ids: {preview}{more}). Provide more calibration data for "
-            "per-leaf model-form uncertainty.",
+            f"{n_fallback} leaves received ZERO calibration points; their "
+            f"quadratic_uncertainty falls back to the global mean sigma "
+            f"(a per-leaf σ there would equal |prediction|). Leaf ids: "
+            f"{preview}{more}. Calibrate on data that covers every leaf.",
             UserWarning,
             stacklevel=2,
         )

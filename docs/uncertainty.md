@@ -24,7 +24,9 @@ port: it is the epistemic variance of the *fitted mean*, so σ collapses
 toward 0 at leaf centres and is **not** a predictive std. When you need a
 predictive std — e.g. to feed `calibration_metrics` — use
 `mode="prediction"`, which adds the irreducible-noise term and uses the
-unbiased residual variance `s² = SSR/max(n−p, 1)`:
+residual variance `s²` (the per-leaf `SSR/max(n−p, 1)`, **floored by the
+global pooled residual variance** so interpolating/small leaves don't
+report ~0 uncertainty):
 
     σ_pred(x) = sqrt( s² · (1 + 1/n + Σⱼ (xⱼ − μⱼ)² / ((n−1) σⱼ²)) )
 

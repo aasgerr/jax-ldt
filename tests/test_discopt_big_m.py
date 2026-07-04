@@ -154,3 +154,17 @@ def test_to_discopt_decision_tree_rejects_non_identity_transform(rng) -> None:
     ).fit(X, y)
     with pytest.raises(ValueError, match="identity transform_matrix"):
         to_discopt_decision_tree(model)
+
+
+@pytest.mark.discopt
+def test_big_m_given_without_bounds_warns(rng) -> None:
+    """R1: a big_m that cannot be validated (x_vars has no usable bounds)
+    must warn — silently trusting it reintroduces the H5 hole."""
+    X = rng.uniform(-1.0, 1.0, size=(80, 2))
+    y = (X**2).sum(axis=1)
+    model = LinearTreeRegressor(max_depth=2, max_bins=4, min_samples_leaf=10).fit(X, y)
+
+    m = discopt.Model("nobounds-bigm")
+    x = m.continuous("x", shape=(2,))  # no lb/ub -> ±1e20 sentinels, unusable
+    with pytest.warns(UserWarning, match="big_m.*cannot be validated"):
+        embed_in_discopt_model(model, m, x, big_m=5.0)

@@ -52,31 +52,36 @@ def test_hyperplane_wrapper_gridsearch_and_clone(rng) -> None:
     X = rng.uniform(-1, 1, size=(120, 2))
     y = X[:, 0] + X[:, 1]
     base = SklearnHyperplaneTreeRegressor(max_depth=3, min_samples_leaf=10)
-    # clone round-trips params.
+    # clone round-trips ALL params (not just one).
     c = clone(base)
-    assert c.get_params()["num_terms"] == base.get_params()["num_terms"]
+    assert c.get_params() == base.get_params()
     gs = GridSearchCV(base, {"num_terms": [2], "max_weight": [1, 2]}, cv=3)
     gs.fit(X, y)
-    assert np.isfinite(gs.best_score_)
+    # The tuned model must actually learn this additive target well, not
+    # merely produce a finite score.
+    best = gs.best_estimator_
+    assert best.score(X, y) > 0.9, f"HT wrapper fit poorly: R2={best.score(X, y)}"
 
 
 @pytest.mark.parametrize(
     "cls", [SklearnLinearTreeRegressor, SklearnHyperplaneTreeRegressor]
 )
-def test_check_estimator_unfitted_contract(cls) -> None:
-    """The specific check that previously failed: estimators must raise
-    NotFittedError when predict is called before fit."""
-    from sklearn.utils.estimator_checks import check_estimator
-
-    est = cls(max_depth=3, min_samples_leaf=5)
-    # Run the full estimator check suite; if the installed sklearn version
-    # flags unrelated numeric-tag checks, at least the unfitted contract
-    # (the M11 target) must hold — assert that directly as a guaranteed
-    # floor, and treat the broad suite as best-effort.
+def test_unfitted_predict_raises_notfitted(cls) -> None:
+    """M11 target: predict/score before fit must raise NotFittedError."""
     with pytest.raises(NotFittedError):
         cls().predict(np.zeros((2, 2)))
-    try:
-        check_estimator(est)
-    except Exception as exc:  # pragma: no cover - version-dependent
-        # Tolerate non-unfitted check failures across sklearn versions.
-        assert "unfitted" not in str(exc).lower(), exc
+    with pytest.raises(NotFittedError):
+        cls().score(np.zeros((2, 2)), np.zeros(2))
+
+
+def test_fit_predict_score_roundtrip_and_1d_x_raises(rng) -> None:
+    """A concrete, version-stable conformance slice: fit→predict→score
+    works and 1-D X is rejected (rather than relying on the full,
+    version-fragile check_estimator suite)."""
+    X = rng.uniform(-1, 1, size=(120, 3))
+    y = X[:, 0] + X[:, 1]
+    m = SklearnLinearTreeRegressor(max_depth=3, min_samples_leaf=8).fit(X, y)
+    assert m.predict(X).shape == (120,)
+    assert m.score(X, y) > 0.9
+    with pytest.raises(ValueError):
+        m.predict(np.zeros(3))  # 1-D X

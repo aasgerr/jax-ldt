@@ -226,13 +226,16 @@ class ActiveLearner:
             self.acquisition.update_best(self.y_observed)
         scores = np.asarray(self.acquisition.score(self.model, jnp.asarray(candidates)))
 
-        # Give a seed-aware batcher (e.g. DiverseBatchSelector) a
-        # reproducible per-round seed derived from the loop's fold-in RNG,
-        # so k-means++ seeding varies across rounds yet survives save/load.
-        if hasattr(self.batcher, "seed"):
-            self.batcher.seed = int(
-                jax.random.randint(self._next_rng_key(), (), 0, 2**31 - 1)
-            )
+        # Give a seed-aware batcher (e.g. DiverseBatchSelector) that has NO
+        # seed of its own a reproducible per-round seed derived from the
+        # loop's fold-in RNG, so k-means++ seeding varies across rounds yet
+        # survives save/load. If the user set an explicit seed on their
+        # selector, respect it (don't clobber it). We consume an RNG key
+        # either way so the candidate/seed stream stays deterministic
+        # regardless of which branch runs.
+        _round_seed = int(jax.random.randint(self._next_rng_key(), (), 0, 2**31 - 1))
+        if getattr(self.batcher, "seed", "no-seed-attr") is None:
+            self.batcher.seed = _round_seed
         idx = self.batcher.select(candidates, scores, self.batch_size)
         X_batch = candidates[idx]
         scores_batch = scores[idx]

@@ -294,6 +294,22 @@ def embed_in_discopt_model(
     except (AttributeError, TypeError):
         pass
 
+    if not have_bounds and user_big_m is not None:
+        # We cannot validate the user's big_m without bounds, so we can't
+        # guarantee it is large enough — an undersized big_m would silently
+        # cut off subtrees (the H5 failure mode). Warn rather than trust it
+        # blindly.
+        warnings.warn(
+            f"embed_in_discopt_model: big_m={user_big_m} cannot be validated "
+            "because x_vars exposes no usable finite bounds; if it is smaller "
+            "than some split threshold or leaf-output magnitude the MIP will "
+            "silently cut off feasible leaves. Set finite bounds on x_vars so "
+            "big_m can be checked, or ensure big_m comfortably exceeds the "
+            "feature/threshold scale.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     if not have_bounds and user_big_m is None:
         fallback = 1e6
         warnings.warn(
