@@ -142,6 +142,22 @@ def _weighted_loss(name: str):
     return _WEIGHTED_LOSS_FNS[name]
 
 
+def _pick_block_size(n_cand: int, N: int, T: int, n_aug: int) -> int:
+    """Candidate-block size that caps the split kernel's peak memory.
+
+    The kernel's dominant intermediates are ``(block, N, T)`` predictions
+    and ``(block, N, n_aug)`` weighted designs. Sizing ``block`` so that
+    ``block * N * (T + n_aug)`` stays around a few million float64 values
+    (~tens of MB) bounds peak memory at O(block·N·(T+n_aug)) instead of
+    the O(K·B·N·T) of an all-at-once vmap — which OOMs on large data.
+    """
+    per_cand = max(1, int(N) * (max(int(T), 1) + int(n_aug)))
+    target_elems = 4_000_000  # ~32 MB of float64
+    block = max(1, target_elems // per_cand)
+    n_cand = int(n_cand)
+    return max(1, min(n_cand if n_cand > 0 else 1, block))
+
+
 def _evaluate_splits_kernel(
     X_aug: jnp.ndarray,  # (N, n_aug)
     y: jnp.ndarray,  # (N, T)
@@ -183,27 +199,32 @@ def _evaluate_splits_kernel(
     mb_flat = mb.reshape(K * B, N)
     ma_flat = ma.reshape(K * B, N)
 
-    theta_below_flat = _fit_many_sides(X_aug, y, mb_flat, ridge)  # (K*B, n_aug, T)
-    theta_above_flat = _fit_many_sides(X_aug, y, ma_flat, ridge)
-
-    # Predict for all N rows under each candidate
-    # X_aug @ theta gives (N, T); for K*B candidates we einsum
-    yh_below = jnp.einsum("nf,ift->int", X_aug, theta_below_flat)  # (K*B, N, T)
-    yh_above = jnp.einsum("nf,ift->int", X_aug, theta_above_flat)
-
     weighted_loss = _weighted_loss(loss_name)
-    # Evaluate the loss of the *combined* piecewise prediction over the
-    # whole node (upstream convention, `_classes.py` overall_error). A
-    # row takes its own side's prediction; rows outside the node get 0
-    # and are excluded by the `node_mask` weights. This is
-    # criterion-correct for every loss: for mean-type losses (mae, msle)
-    # it reduces exactly to the sample-count-weighted average of the two
-    # sides, but for rmse it pools correctly under the sqrt and for
-    # max_abs it takes the max across sides — a per-side weighted average
-    # understates both and picks the wrong split.
-    yh_combined = yh_below * mb_flat[:, :, None] + yh_above * ma_flat[:, :, None]
-    overall_flat = jax.vmap(lambda yh: weighted_loss(y, yh, node_mask))(yh_combined)
-    overall_flat = jnp.sum(overall_flat, axis=-1)  # sum over targets
+
+    def _one_candidate(mb_ma):
+        # Per-candidate fit + combined-prediction loss. Evaluated over the
+        # whole node (upstream convention): each row takes its own side's
+        # prediction; rows outside the node get 0 and are excluded by the
+        # node_mask weights. Criterion-correct for every loss — for
+        # mean-type losses (mae, msle) it reduces to the sample-weighted
+        # average of the two sides, but rmse pools under the sqrt and
+        # max_abs takes the max across sides.
+        mb_row, ma_row = mb_ma  # each (N,)
+        theta_b = _fit_one_side(X_aug, y, mb_row, ridge)  # (n_aug, T)
+        theta_a = _fit_one_side(X_aug, y, ma_row, ridge)
+        yh_b = X_aug @ theta_b  # (N, T)
+        yh_a = X_aug @ theta_a
+        yh_c = yh_b * mb_row[:, None] + yh_a * ma_row[:, None]
+        loss = jnp.sum(weighted_loss(y, yh_c, node_mask))  # scalar over targets
+        return loss, theta_b, theta_a
+
+    # Chunk the K*B candidates so peak memory is bounded (see
+    # `_pick_block_size`). `lax.map` vmaps within each block and scans
+    # over blocks, so results are identical to an all-at-once vmap.
+    block = _pick_block_size(K * B, N, y.shape[1], X_aug.shape[1])
+    overall_flat, theta_below_flat, theta_above_flat = jax.lax.map(
+        _one_candidate, (mb_flat, ma_flat), batch_size=block
+    )
     overall_flat = jnp.where(valid.reshape(K * B), overall_flat, jnp.inf)
     overall_flat = jnp.nan_to_num(overall_flat, nan=jnp.inf, posinf=jnp.inf)
 
