@@ -19,6 +19,22 @@ from jax_ldt import LinearPropagationUQ
 sigma = LinearPropagationUQ().predict(model.tree_, X)
 ```
 
+**Modes.** The default `mode="upstream"` (shown above) is the historical
+port: it is the epistemic variance of the *fitted mean*, so σ collapses
+toward 0 at leaf centres and is **not** a predictive std. When you need a
+predictive std — e.g. to feed `calibration_metrics` — use
+`mode="prediction"`, which adds the irreducible-noise term and uses the
+unbiased residual variance `s² = SSR/max(n−p, 1)`:
+
+    σ_pred(x) = sqrt( s² · (1 + 1/n + Σⱼ (xⱼ − μⱼ)² / ((n−1) σⱼ²)) )
+
+```python
+sigma_pred = LinearPropagationUQ().predict(model.tree_, X, mode="prediction")
+```
+
+The default is kept as `"upstream"` so existing acquisition behaviour and
+saved-model numbers do not change silently.
+
 ## Quadratic-difference UQ
 
 Refits each leaf with quadratic features (cross-products) and reports

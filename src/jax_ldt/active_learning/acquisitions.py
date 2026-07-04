@@ -25,6 +25,20 @@ class _ModelLike(Protocol):
     def predict(self, X: jnp.ndarray) -> jnp.ndarray: ...
 
 
+def _check_direction(direction: str) -> None:
+    """Reject anything but ``"min"`` / ``"max"``.
+
+    Any other string (``"minimize"``, ``"Min"``, …) previously fell
+    through the ``== "min"`` checks and silently flipped the acquisition
+    to maximize — a silently inverted optimization direction that only
+    surfaces when the campaign converges to the wrong extremum.
+    """
+    if direction not in ("min", "max"):
+        raise ValueError(
+            f"direction must be 'min' or 'max'; got {direction!r}."
+        )
+
+
 def _sigma(model: _ModelLike, X: jnp.ndarray) -> jnp.ndarray:
     """Per-sample predictive σ. Always 1-D ``(N,)``.
 
@@ -93,6 +107,9 @@ class ExpectedImprovement:
     xi: float = 0.0
     _y_best: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        _check_direction(self.direction)
+
     def update_best(self, y_observed: np.ndarray) -> None:
         y = np.asarray(y_observed).reshape(-1)
         if y.size == 0:
@@ -121,6 +138,9 @@ class ProbabilityOfImprovement:
     direction: str = "min"
     xi: float = 0.0
     _y_best: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        _check_direction(self.direction)
 
     def update_best(self, y_observed: np.ndarray) -> None:
         y = np.asarray(y_observed).reshape(-1)

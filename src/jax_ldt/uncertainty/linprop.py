@@ -1,13 +1,25 @@
 """Linear-propagation uncertainty.
 
-For a leaf with `n` training points, sample mean `μ`, sample variance
-`σ²`, and leaf MSE `m`:
+Two modes (see :func:`_per_sample_uncertainty`):
 
-    σ_pred(x) = sqrt(m/n + Σⱼ (xⱼ - μⱼ)² / ((n-1) σⱼ²))
+``"upstream"`` (default) — a faithful port of upstream's
+``TorchLinearRegression.linprop_uncertainty``:
 
-This is a port of upstream's `TorchLinearRegression.linprop_uncertainty`,
-adapted to operate on the per-leaf UQ blob already populated during
-tree growth.
+    σ(x) = sqrt(m/n + Σⱼ (xⱼ - μⱼ)² / ((n-1) σⱼ²)),   m = SSR/n
+
+This is the epistemic variance of the fitted mean; it collapses to ~0 at
+leaf centres as n grows and is *not* a predictive std. It is kept as the
+default so existing acquisition behaviour and saved-model numbers do not
+change.
+
+``"prediction"`` — a proper predictive std with the irreducible-noise
+term and an unbiased residual variance ``s² = SSR/max(n−p, 1)``:
+
+    σ(x) = sqrt( s² · (1 + 1/n + Σⱼ (xⱼ - μⱼ)² / ((n-1) σⱼ²)) )
+
+Use this when feeding σ to :func:`calibration_metrics` (which treats it
+as a Gaussian predictive std); ``"upstream"`` there under-covers badly.
+Both operate on the per-leaf UQ blob populated during tree growth.
 """
 
 from __future__ import annotations
@@ -31,8 +43,23 @@ def _resolve_tree(model_or_tree) -> Tree:
     return tree
 
 
-def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray) -> jnp.ndarray:
+def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray, mode: str) -> jnp.ndarray:
     """Compute σ_pred for one sample (shape: (n_features_in,)).
+
+    ``mode``:
+
+    * ``"upstream"`` (default): the historical port formula
+      ``σ² = mse/n + Σ(x−μ)²/((n−1)σ_x²)`` with ``mse = SSR/n``. This is
+      the variance of the fitted *mean* (epistemic only) and is what the
+      acquisition functions have always consumed; kept as the default so
+      numbers do not change silently.
+    * ``"prediction"``: a proper predictive std
+      ``σ² = s²·(1 + 1/n + Σ(x−μ)²/((n−1)σ_x²))`` with the unbiased
+      residual variance ``s² = SSR/max(n−p, 1)`` (``p =
+      n_features_transformed + 1``). The ``+1`` adds the irreducible
+      noise term, so σ does not collapse to 0 at leaf centres and the
+      value is appropriate to feed to ``calibration_metrics`` as a
+      Gaussian predictive std.
 
     Edge cases:
 
@@ -86,18 +113,33 @@ def _per_sample_uncertainty(tree: Tree, x_in: jnp.ndarray) -> jnp.ndarray:
     safe_n_minus_one = jnp.where(has_variance, n - 1.0, 1.0)
     deviation = jnp.where(has_variance, raw_deviation / safe_n_minus_one, 0.0)
 
-    sigma_sq = base + deviation  # broadcast: (n_targets,)
+    if mode == "prediction":
+        # Unbiased residual variance s² = SSR/(n-p); the stored mse is
+        # SSR/n, so s² = mse·n/(n-p). Predictive variance adds the
+        # irreducible-noise term (the leading 1).
+        p = float(tree.n_features_transformed) + 1.0
+        ssr = mse * n  # (n_targets,)
+        denom_df = jnp.where(n > p, n - p, 1.0)
+        s_sq = ssr / denom_df
+        sigma_sq = s_sq * (1.0 + 1.0 / safe_n + deviation)
+    else:  # "upstream" (default)
+        sigma_sq = base + deviation  # broadcast: (n_targets,)
     return jnp.sqrt(jnp.clip(sigma_sq, min=0.0))
 
 
-def linprop_uncertainty(model_or_tree, X: jnp.ndarray) -> jnp.ndarray:
+def linprop_uncertainty(model_or_tree, X: jnp.ndarray, *, mode: str = "upstream") -> jnp.ndarray:
     """Per-sample uncertainty (n_samples, n_targets) or (n_samples,) if T=1.
 
     Accepts either a fitted regressor (with `.tree_`) or a `Tree` pytree.
+    ``mode`` is ``"upstream"`` (default, epistemic mean variance — the
+    historical formula) or ``"prediction"`` (a full predictive std); see
+    :func:`_per_sample_uncertainty`.
     """
+    if mode not in ("upstream", "prediction"):
+        raise ValueError(f"mode must be 'upstream' or 'prediction'; got {mode!r}")
     tree = _resolve_tree(model_or_tree)
     X = jnp.asarray(X, dtype=jnp.float64)
-    out = jax.vmap(lambda x: _per_sample_uncertainty(tree, x))(X)  # (N, T)
+    out = jax.vmap(lambda x: _per_sample_uncertainty(tree, x, mode))(X)  # (N, T)
     if tree.n_targets == 1:
         out = out[:, 0]
     return out
@@ -111,5 +153,5 @@ class LinearPropagationUQ:
     fitted regressor or a `Tree` pytree.
     """
 
-    def predict(self, model_or_tree, X: jnp.ndarray) -> jnp.ndarray:
-        return linprop_uncertainty(model_or_tree, X)
+    def predict(self, model_or_tree, X: jnp.ndarray, *, mode: str = "upstream") -> jnp.ndarray:
+        return linprop_uncertainty(model_or_tree, X, mode=mode)

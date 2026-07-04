@@ -17,6 +17,13 @@ We solve the normal equations `(XᵀX + ridge·I) β = Xᵀy` because:
 
 Ridge is added BEFORE the solve (ridge·I is folded into XᵀX). This is
 the order assumed by upstream and pinned by `test_principled_choices.py`.
+
+Note: ``ridge`` is an **absolute** penalty added to ``XᵀWX`` — it is not
+scaled by the data. On badly scaled features (e.g. magnitudes ≳ 1e6)
+``‖XᵀX‖`` dwarfs the default ``ridge=1e-5``, so the penalty becomes
+negligible relative to the matrix and a singular/collinear side can
+produce NaN fits (discarded as invalid). Standardize such features (or
+raise ``ridge``) before fitting; a scale-invariant ridge is future work.
 """
 
 from __future__ import annotations

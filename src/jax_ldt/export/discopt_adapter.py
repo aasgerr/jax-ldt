@@ -67,6 +67,21 @@ def to_discopt_decision_tree(model_or_tree):
         if tree is None:
             raise ValueError("Pass a fitted model or a Tree pytree.")
 
+    # The returned DecisionTree splits on the *transformed* feature space.
+    # For an axis-aligned LMDT that equals the raw input space (identity
+    # transform), but a hyperplane tree lifts features — silently emitting
+    # a DecisionTree over lifted columns would mis-route a consumer that
+    # feeds raw x, with no dimension error to catch it.
+    A = np.asarray(tree.transform_matrix)
+    n_in = int(tree.n_features_in)
+    if A.shape != (n_in, n_in) or not np.allclose(A, np.eye(n_in)):
+        raise ValueError(
+            "to_discopt_decision_tree requires an identity transform_matrix "
+            "(axis-aligned tree). This tree lifts features into an oblique "
+            "space, so the DecisionTree would split on lifted columns and a "
+            "raw-x consumer would mis-route. Use embed_in_discopt_model instead."
+        )
+
     leaf_params = np.asarray(tree.leaf_params)  # (n_nodes, n_aug, T)
     is_leaf = np.asarray(tree.is_leaf)
     # For "constant-leaf" check: every leaf row must have only the bias entry nonzero.

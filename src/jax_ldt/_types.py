@@ -30,8 +30,13 @@ class LeafUQ:
     """
 
     n: jax.Array  # (n_nodes,) int — sample count in the leaf
-    x_mean: jax.Array  # (n_nodes, n_features) float — feature means
-    x_var: jax.Array  # (n_nodes, n_features) float — feature variances
+    # NOTE: x_mean/x_var are in *transformed* space (length
+    # n_features_transformed), not the raw input space — they are computed
+    # from X_t. For a hyperplane tree that is the lifted column space, so
+    # these are NOT per-input-feature. `linprop` consumes them in this
+    # space consistently.
+    x_mean: jax.Array  # (n_nodes, n_features_transformed) float
+    x_var: jax.Array  # (n_nodes, n_features_transformed) float
     mse: jax.Array  # (n_nodes, n_targets) float — leaf MSE
 
 
@@ -47,13 +52,19 @@ def _leaf_uq_unflatten(_aux: None, children: tuple[jax.Array, ...]) -> LeafUQ:
 jax.tree_util.register_pytree_node(LeafUQ, _leaf_uq_flatten, _leaf_uq_unflatten)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Tree:
     """Trained tree: parallel-array topology + per-leaf linear models.
 
     Dynamic (pytree) fields are jax.Arrays. Static (auxiliary) fields are
-    Python scalars / tuples; they participate in `==` comparisons but not
-    in tree-map traversals.
+    Python scalars / tuples used as the pytree's aux data (they drive
+    tree-def equality / hashing for JIT, not tree-map traversals).
+
+    ``eq=False``: a dataclass-generated ``__eq__`` over the jax.Array
+    fields raises on the ambiguous truth value of an array comparison,
+    and the paired ``__hash__`` would make the frozen instance
+    unhashable. We therefore keep object identity for ``==``/``hash`` and
+    rely on the pytree machinery for structural comparison.
     """
 
     # ---- dynamic (children of the pytree) ----

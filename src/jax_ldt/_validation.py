@@ -74,8 +74,12 @@ def _validate_fit_inputs(X: jnp.ndarray, y: jnp.ndarray) -> None:
         raise ValueError(f"X must be 2-D (n_samples, n_features); got shape {tuple(X.shape)}")
     if X.shape[0] == 0:
         raise ValueError("X must have at least 1 sample.")
+    if X.shape[1] == 0:
+        raise ValueError("X must have at least 1 feature; got shape (n, 0).")
     if y.ndim not in (1, 2):
         raise ValueError(f"y must be 1-D or 2-D; got shape {tuple(y.shape)}")
+    if y.ndim == 2 and y.shape[1] == 0:
+        raise ValueError("y must have at least 1 target column; got shape (n, 0).")
     if y.shape[0] != X.shape[0]:
         raise ValueError(
             f"X and y first-dim mismatch: X.shape[0]={X.shape[0]}, y.shape[0]={y.shape[0]}"

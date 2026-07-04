@@ -259,6 +259,12 @@ class ConformalCalibrator:
         If `model` is provided, use it to recompute point predictions;
         otherwise, the calibrator must have been calibrated against a
         model whose `tree_` matches `self._tree`.
+
+        Multi-target note: intervals are computed per target from
+        independent per-target residual quantiles, so each target's
+        interval has marginal coverage ``1 - alpha`` but the joint box
+        (all targets covered simultaneously) has coverage roughly
+        ``(1 - alpha)^T`` for independent residuals — lower than nominal.
         """
         if self.state_ is None or self._tree is None:
             raise RuntimeError("Call calibrate(...) first.")

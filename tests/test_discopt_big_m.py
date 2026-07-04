@@ -138,3 +138,19 @@ def test_unbounded_sentinel_triggers_fallback_warning(rng) -> None:
     x = m.continuous("x", shape=(2,))  # no lb/ub → discopt exposes ±1e20
     with pytest.warns(UserWarning, match=r"no usable finite bounds"):
         embed_in_discopt_model(model, m, x)
+
+
+@pytest.mark.discopt
+def test_to_discopt_decision_tree_rejects_non_identity_transform(rng) -> None:
+    """Phase 4 item 11: a hyperplane (lifted) tree must not silently
+    convert to a DecisionTree over lifted columns."""
+    from jax_ldt import HyperplaneTreeRegressor
+    from jax_ldt.export import to_discopt_decision_tree
+
+    X = rng.uniform(-1, 1, size=(120, 2))
+    y = (X[:, 0] > 0).astype(float)  # constant-ish leaves
+    model = HyperplaneTreeRegressor(
+        max_depth=2, min_samples_leaf=20, max_weight=1, num_terms=2
+    ).fit(X, y)
+    with pytest.raises(ValueError, match="identity transform_matrix"):
+        to_discopt_decision_tree(model)

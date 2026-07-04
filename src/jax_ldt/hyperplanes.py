@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-import math
 import warnings
 from typing import Optional
 
@@ -142,10 +141,6 @@ def symmetrize(
     return jnp.asarray(uniq, dtype=jnp.float64)
 
 
-def _factorial(n: int) -> int:
-    return math.factorial(n)
-
-
 def build_transform_matrix(
     X: jnp.ndarray,
     *,
@@ -172,9 +167,17 @@ def build_transform_matrix(
     X = jnp.asarray(X)
     n_cols = int(X.shape[1])
 
+    if num_terms < 1:
+        raise ValueError(f"num_terms must be >= 1; got {num_terms}")
+
     if categorical_features is None:
         categorical_features = ()
     cat_set = set(categorical_features)
+    bad_cat = sorted(c for c in cat_set if c < 0 or c >= n_cols)
+    if bad_cat:
+        raise ValueError(
+            f"categorical_features out of range for {n_cols}-feature X: {bad_cat}"
+        )
     cols_to_perm = tuple(c for c in range(n_cols) if c not in cat_set)
     n_non_cat = len(cols_to_perm)
 
@@ -188,6 +191,12 @@ def build_transform_matrix(
         LCs_arr = jnp.asarray(rows, dtype=jnp.float64)
     else:
         LCs_arr = jnp.asarray(LCs, dtype=jnp.float64)
+        if LCs_arr.ndim != 2 or LCs_arr.shape[1] != num_terms:
+            raise ValueError(
+                f"hyperplane_weights/LCs must have shape (n_rows, num_terms="
+                f"{num_terms}); got {tuple(LCs_arr.shape)}. Set num_terms to the "
+                "LC width."
+            )
 
     if do_symmetrize:
         LCs_arr = symmetrize(LCs_arr, tol_decimals=tol_decimals)
@@ -199,7 +208,17 @@ def build_transform_matrix(
     # 1 (e.g. a user-supplied `[0.5, 0.5]` with do_symmetrize=False).
     LCs_np_filter = np.asarray(LCs_arr)
     n_nonzero = np.sum(np.abs(LCs_np_filter) > 1e-12, axis=1)
-    keep = n_nonzero != 1
+    n_all_zero = int(np.sum(n_nonzero == 0))
+    if n_all_zero > 0:
+        warnings.warn(
+            f"build_transform_matrix: dropped {n_all_zero} all-zero LC row(s) "
+            "(a constant-zero lifted feature carries no split information).",
+            UserWarning,
+            stacklevel=2,
+        )
+    # Keep only genuine oblique rows: >1 nonzero entry. Rows with exactly
+    # one nonzero duplicate the identity block; all-zero rows are dead.
+    keep = n_nonzero > 1
     LCs_arr = LCs_arr[jnp.asarray(keep)]
     n_lcs = int(LCs_arr.shape[0])
 
