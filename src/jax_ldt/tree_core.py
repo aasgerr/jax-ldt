@@ -55,7 +55,7 @@ class _GrowNode:
     # for UQ:
     leaf_x_mean: jax.Array  # (n_features,)
     leaf_x_var: jax.Array  # (n_features,)
-    leaf_n: int
+    leaf_n: object  # device scalar for leaves, int 0 for placeholders
     leaf_mse: jax.Array  # (n_targets,)
 
 
@@ -235,11 +235,12 @@ _evaluate_splits = jax.jit(
 )
 
 
-# Leaf-fit alias: the JIT cache from `_fit_one_side` (used vmapped during
-# growth) and a direct call use the same primitives, so we just expose the
-# function under a clearer name. Removing the previous extra `jax.jit(...)`
-# wrapper avoids a redundant trace at leaf-finalisation time.
-_fit_leaf = _fit_one_side
+# Leaf-fit: `_fit_one_side` is only JIT-compiled *inside* `_evaluate_splits`
+# (via the vmapped `_fit_many_sides`). A bare alias would run eagerly — one
+# per-op dispatch (Cholesky solve + full-N matmuls) for every finalized or
+# pruned leaf. Wrapping it in its own `jax.jit` compiles the leaf fit once
+# and reuses it across all leaves.
+_fit_leaf = jax.jit(_fit_one_side)
 
 
 # --------------------------------------------------------------------------
@@ -442,17 +443,17 @@ def grow_tree(
 
     def _leaf_stats(
         mask: jnp.ndarray, params: jnp.ndarray
-    ) -> tuple[jnp.ndarray, jnp.ndarray, int, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Compute (x_mean, x_var, n, mse) for the active rows under ``mask``.
 
         Computed in a single jit'd callable so the four reductions
         (``nm``, ``x_mean``, ``x_var``, ``mse``) share one device kernel
-        invocation. The previous version did each reduction separately
-        and triggered a host sync inside the loop via ``int(nm)``; we
-        return ``nm`` as a JAX scalar and convert at the call site.
+        invocation. ``nm`` is returned as a *device* scalar (not
+        ``int(nm)``): a per-leaf ``int()`` would force a host sync inside
+        the growth loop. The scalars are stacked and converted to int32
+        once at the final packing step instead.
         """
-        x_mean, x_var, nm, mse = _leaf_stats_kernel(mask, X_t, X_aug, y, params)
-        return x_mean, x_var, int(nm), mse
+        return _leaf_stats_kernel(mask, X_t, X_aug, y, params)
 
     def _finalize_leaf(node_id: int, mask: jnp.ndarray, params: jnp.ndarray) -> None:
         """Mark an existing placeholder node as a leaf and populate its
@@ -492,6 +493,9 @@ def grow_tree(
     queue: list[tuple[int, int]] = [(root_id, 0)]
 
     split_feats_arr = jnp.asarray(split_features, dtype=jnp.int32)
+    # Loop-invariant: the split-feature columns of X_t are the same for
+    # every node (only the mask varies), so gather them once.
+    X_split = X_t[:, split_feats_arr]
 
     # Numpy mirror of `X_t` used for all host-side mask arithmetic.
     # Computed once per `grow_tree` call. The JIT'd split kernel still
@@ -528,7 +532,6 @@ def grow_tree(
             _finalize_leaf(node_id, mask, params)
             continue
 
-        X_split = X_t[:, split_feats_arr]
         overall, theta_b, theta_a, n_below, n_above = _evaluate_splits(
             X_fit,
             y,
