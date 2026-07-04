@@ -256,12 +256,15 @@ _evaluate_splits = jax.jit(
 )
 
 
-# Leaf-fit: `_fit_one_side` is only JIT-compiled *inside* `_evaluate_splits`
-# (via the vmapped `_fit_many_sides`). A bare alias would run eagerly — one
-# per-op dispatch (Cholesky solve + full-N matmuls) for every finalized or
-# pruned leaf. Wrapping it in its own `jax.jit` compiles the leaf fit once
-# and reuses it across all leaves.
-_fit_leaf = jax.jit(_fit_one_side)
+# Leaf-fit alias. Kept as the *eager* `_fit_one_side` rather than a
+# separate `jax.jit(...)`: XLA is free to reorder the solve's
+# floating-point ops, so a jitted leaf fit produces ULP-level different
+# leaf coefficients than the eager path. That perturbation is harmless
+# numerically but flips near-tied downstream consumers (notably discopt's
+# big-M MIP, whose feasibility is numerically fragile). The leaf fit is a
+# small fraction of fit cost (the split kernel dominates), so we keep the
+# eager path for exact, reproducible leaf parameters.
+_fit_leaf = _fit_one_side
 
 
 # --------------------------------------------------------------------------

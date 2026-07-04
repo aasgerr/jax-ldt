@@ -15,12 +15,14 @@ def test_predict_traces_once_for_same_shape(rng) -> None:
     y = X.sum(axis=1)
     model = LinearTreeRegressor(max_depth=3, min_samples_leaf=10).fit(X, y)
 
-    before = _predict_jit._cache_size()
+    # First call may or may not compile (the shared jit cache may already
+    # hold a same-shape specialization from another test); the invariant
+    # we care about is that a SECOND identical call adds no compilation.
     r1 = np.asarray(model.predict(X[:50]))
+    mid = _predict_jit._cache_size()
     r2 = np.asarray(model.predict(X[:50]))
     after = _predict_jit._cache_size()
-    # Exactly one new compiled specialization for this (tree, shape).
-    assert after - before == 1
+    assert after == mid, "second same-shape predict recompiled"
     np.testing.assert_array_equal(r1, r2)
 
 
@@ -28,10 +30,10 @@ def test_apply_traces_once_for_same_shape(rng) -> None:
     X = rng.uniform(-1, 1, size=(150, 2))
     y = X.sum(axis=1)
     model = LinearTreeRegressor(max_depth=3, min_samples_leaf=10).fit(X, y)
-    before = _apply_jit._cache_size()
     model.apply(X[:40])
+    mid = _apply_jit._cache_size()
     model.apply(X[:40])
-    assert _apply_jit._cache_size() - before == 1
+    assert _apply_jit._cache_size() == mid, "second same-shape apply recompiled"
 
 
 def test_jit_predict_matches_reference(rng) -> None:
