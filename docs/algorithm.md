@@ -54,9 +54,10 @@ Per node:
 1. Compute candidate thresholds: `max_bins - 1` quantile cuts of each
    split feature on the active subdomain.
 2. **Inner kernel** (JIT-compiled): for each candidate (column, bin),
-   fit two ridge regressions (left and right side) using the side mask
-   as a 0/1 sample weight, then evaluate weighted MAE / RMSE. The
-   K·B candidates are vmapped — a single fused kernel handles them.
+   evaluate two ridge regressions (left and right side) using the side
+   mask as a 0/1 sample weight, then score the combined piecewise
+   prediction under the chosen criterion. The K·B candidates are
+   vmapped — a single fused kernel handles them.
 3. Pick the candidate with lowest combined loss; if no valid split or
    the depth limit is reached, finalise the node as a leaf.
 
@@ -64,12 +65,60 @@ The split kernel is shape-stable (sample axis is always `N`, the full
 training set) so JIT compiles once. Subdomain selection is via mask
 multiplication, not slicing.
 
+Each node's own regression is fitted exactly once, when the node is
+created: the same parameters serve as its `min_impurity_decrease`
+baseline and, if growth stops there, as its leaf model.
+
+### Candidate fits live in the input space, not the lifted space
+
+The candidate kernel never forms an `n_aug × n_aug` system, and this is
+what keeps hyperplane fits affordable. The fitting design matrix always
+factors as
+
+```
+X_fit = Z @ B        Z = [1, X]  (N × m,  m = n_features_in + 1)
+                     B = blockdiag(1, A), columns outside `linear_features` zeroed
+```
+
+because every lifted column is by construction a linear function of the
+original features. The ridge solve then satisfies the push-through
+identity
+
+```
+(Bᵀ G B + λI)⁻¹ Bᵀ v  =  Bᵀ (G BBᵀ + λI)⁻¹ v      G = ZᵀWZ,  v = ZᵀWy
+```
+
+so a candidate's fitted values are `ŷ = (Z·BBᵀ) · (G·BBᵀ + λI)⁻¹ v` —
+all in `m` dimensions, whatever the lift's width. Cost per candidate
+drops from `O(N·n_aug² + n_aug³)` to `O(N·m² + m³)`.
+
+This is an algebraic identity, not an approximation: candidate losses
+agree with the dense `n_aug`-space fit to round-off (~1e-15 relative),
+pinned by `tests/test_hyperplane_scaling.py`. The *leaf* parameters are
+still solved densely in the lifted space, because those coefficients are
+what gets exported (JSON / ONNX / discopt) and reproducibility of the
+exported model matters more there than the cubic term.
+
+Candidates are evaluated in column chunks sized to a fixed memory budget
+(`tree_core.SPLIT_MEMORY_BUDGET_BYTES`, 64 MiB), so peak allocation does
+not grow with the lifted-feature count. The chunk width is constant for
+a given fit — the tail chunk is padded with `+inf` thresholds, which
+score as invalid — so the kernel still traces once. Problems whose
+candidate set fits the budget (nearly all of them) take a single call
+and are bit-identical to an unchunked evaluation.
+
+See [Benchmarks → Cost model](benchmarks.md#cost-model) for what this
+means in wall-clock terms.
+
 ## Why ridge regression?
 
 We solve `(XᵀWX + ridge·I) β = XᵀWy` because:
 - the ridge regularisation guarantees positive-definiteness of `XᵀWX`,
   so `jax.scipy.linalg.solve(..., assume_a='pos')` is faster and more
-  stable than `lstsq`;
+  stable than `lstsq` (the reduced-space candidate solve above uses the
+  general solver, since `G·BBᵀ` is not symmetric — it is still
+  invertible for any `ridge > 0`, as `G·BBᵀ` has real non-negative
+  eigenvalues);
 - it's well-defined even when `W` has very few nonzero entries — important
   because invalid candidate splits still produce *some* coefficients
   during the vmapped batch (we discard them via a validity mask after).

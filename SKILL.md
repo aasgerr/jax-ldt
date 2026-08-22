@@ -262,7 +262,11 @@ directly with discopt primitives.
 Practical rules of thumb:
 
 - For 6+ features, keep `num_terms=2` and `max_weight ∈ {1, 2}`. Higher
-  values explode the lifted-feature count combinatorially.
+  values explode the lifted-feature count combinatorially. Check the
+  count before committing to a fit — `count_lifted_features(n_features,
+  num_terms=..., max_weight=...)` returns it without fitting, and fit
+  time tracks it (≤1000 → seconds; >5000 → minutes to hours). Cap it
+  with `max_hyperplanes=...`. See `docs/benchmarks.md` ("Cost model").
 - `min_samples_leaf=15` is a sane default for noisy real data; smaller
   for clean simulators, larger for human-collected lab data.
 - `max_depth=5–8` covers most usable regimes; deeper trees overfit
@@ -280,19 +284,40 @@ Practical rules of thumb:
   Each step calls a JIT-compiled inner kernel.
 - **Inner split kernel** (`_evaluate_splits_kernel`): vmapped over
   `K * B` candidate splits, each a ridge fit on a side-mask. Shape-
-  stable so JIT compiles once. Operates on the full (N, n_aug) tensor
-  with mask multiplication, not slicing.
+  stable so JIT compiles once. Uses mask multiplication over the full
+  sample axis, not slicing. Each candidate is solved in the
+  `m = n_features_in + 1` dimensional space the lifted design matrix
+  actually spans — `X_fit = Z @ B` with `Z = [1, X]`, so the
+  push-through identity `(BᵀGB + λI)⁻¹Bᵀv = Bᵀ(G·BBᵀ + λI)⁻¹v` applies.
+  Exact, and independent of the lift width, which is what keeps
+  hyperplane fits from blowing up (issue #2). Candidates are evaluated
+  in column chunks under a fixed memory budget
+  (`tree_core.SPLIT_MEMORY_BUDGET_BYTES`); ordinary problems take one
+  chunk and are bit-identical to an unchunked evaluation.
+- **Node fits** (`_add_node` / `_finalize_leaf`): a node's regression is
+  solved once, at creation, and reused as both its impurity baseline and
+  its leaf model. Leaf parameters are solved densely in the lifted space
+  (`_fit_one_side`, eager) — those coefficients are the exported model,
+  so reproducibility outranks the cubic cost there.
 - **Hyperplane lifting** (`hyperplanes.build_transform_matrix`):
   enumerates integer-weight rows via Miller indices, symmetrises (parity
   + permutation), de-duplicates at `tol_decimals` precision, prepends
   identity, optionally rescales by feature ranges. Result: matrix `A`
-  such that `X' = X @ A` is the lifted feature space.
+  such that `X' = X @ A` is the lifted feature space. `max_hyperplanes`
+  caps the oblique block (evenly spaced subsequence of the lex-sorted
+  rows); a `UserWarning` fires past
+  `LIFTED_FEATURE_WARN_THRESHOLD` so an intractable configuration
+  reports itself instead of hanging.
 
 ## Common Pitfalls
 
 - **`num_terms > n_features`**: hyperplane enumeration raises if
   `num_terms` exceeds the number of non-categorical features. For 1D,
   use `LinearTreeRegressor`.
+- **Bumping `num_terms` "just to try it"**: it multiplies the lifted
+  feature count, and the per-node leaf solve is cubic in that count. Run
+  `count_lifted_features(...)` first — going from `num_terms=2` to `4`
+  on 8 features takes the lift from 64 columns to 10144.
 - **JIT recompile cost on first call**: ~0.5 s on CPU for the inner
   kernel. Re-fitting trees with the same hyperparameters reuses the
   cached compilation.

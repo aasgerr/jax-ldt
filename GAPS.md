@@ -74,14 +74,28 @@ fits only leaves.
   excluded/categorical dims have zero coefficient and must not inflate σ).
 - **`ridge` is absolute** (not scale-invariant): standardize features at
   scale ≳ 1e6. A relative-ridge option is deferred, not silently applied.
-- **P1 was reverted.** The `lax.map` candidate-chunking optimization was
-  removed (third review): it ran ~2.3× slower than the fused vmap on deep
-  hyperplane trees (scan compile/overhead) and, being only per-candidate
-  numerically equivalent (~1e-14), could flip an exact-tie split and
-  change the tree. The split kernel is back to the fused vmap+einsum. The
-  O(K·B·N·T) peak-memory concern it targeted is a known limitation at
-  extreme sizes (e.g. 200k rows × 50 split features × 24 bins); chunk the
-  data or reduce `max_bins`/`num_terms` there.
+- **P1, revisited (issue #2).** The original `lax.map` candidate-chunking
+  attempt was reverted (third review): it ran ~2.3× slower than the fused
+  vmap on deep hyperplane trees (scan compile/overhead) and, being only
+  per-candidate numerically equivalent (~1e-14), could flip an exact-tie
+  split. The current chunking avoids both objections — it is a Python
+  loop over *column* chunks sized to a 64 MiB budget
+  (`tree_core.SPLIT_MEMORY_BUDGET_BYTES`), so the kernel stays the fused
+  vmap+einsum, and any problem whose candidate set fits the budget takes
+  a single call and is bit-identical to no chunking at all. Above the
+  budget, chunk boundaries perturb reductions at round-off, which can
+  still flip an exact-tie split.
+- **Candidate fits no longer scale with the lift (issue #2).** The split
+  kernel used to run an `O(n_aug³)` dense solve per candidate, making
+  hyperplane fit cost `O(n_lifted⁴)` — `n_features⁸` at the defaults;
+  measured 112 s at 16 features and unbounded past that. Candidates are
+  now solved in the `m = n_features_in + 1` space the lifted design
+  matrix spans (exact push-through identity, see `tree_core` design note
+  5), so candidate cost is independent of the lift width. Remaining
+  cubic term: the per-node *leaf* solve, kept dense because those
+  coefficients are the exported model. `count_lifted_features()`,
+  `max_hyperplanes` and a size warning make a too-large configuration
+  legible up front. Cost model: `docs/benchmarks.md`.
 - **x64 enforced everywhere.** `_require_x64` guards not just fit/predict
   but every UQ (`linprop_uncertainty`, `quadratic_uncertainty`,
   `calibrate_quadratic`, `ConformalCalibrator.calibrate/predict_interval`)

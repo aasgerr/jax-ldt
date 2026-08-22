@@ -86,9 +86,26 @@ class HyperplaneTreeRegressor:
         angles aren't dominated by feature units.
     tol_decimals : int, default ``4``
         Rounding precision used to dedup near-identical hyperplane rows.
+    max_hyperplanes : int, optional
+        Cap on the number of *oblique* directions kept (the identity
+        block is always retained). When the enumeration produces more,
+        an evenly spaced subsequence of the lex-sorted directions is
+        used, and a :class:`UserWarning` is emitted. ``None`` (default)
+        keeps every enumerated direction. Use this when
+        :func:`jax_ldt.hyperplanes.count_lifted_features` says the
+        configuration you want is too large to fit in reasonable time.
     hyperplane_weights : jnp.ndarray, optional
         Pre-built weight rows (shape ``(n_LCs, num_terms)``) overriding
         the Miller enumeration.
+
+    Notes
+    -----
+    Fit cost scales with the *lifted* feature count
+    ``L = count_lifted_features(n_features, num_terms=..., max_weight=...)``,
+    not with ``n_features`` directly. With the defaults
+    (``num_terms=2, max_weight=1``) ``L == n_features ** 2``; raising
+    ``num_terms`` grows it combinatorially. Check ``L`` before fitting a
+    large configuration — see ``docs/benchmarks.md`` ("Cost model").
 
     Attributes
     ----------
@@ -118,6 +135,7 @@ class HyperplaneTreeRegressor:
     do_symmetrize: bool = True
     do_scaling: bool = True
     tol_decimals: int = 4
+    max_hyperplanes: Optional[int] = None
     hyperplane_weights: Optional[jnp.ndarray] = None
 
     # populated after fit
@@ -146,6 +164,7 @@ class HyperplaneTreeRegressor:
             do_scaling=self.do_scaling,
             tol_decimals=self.tol_decimals,
             categorical_features=self.categorical_features,
+            max_hyperplanes=self.max_hyperplanes,
         )
 
         self.tree_ = tree_core.grow_tree(
