@@ -21,7 +21,16 @@ from jax_ldt.tree_core import (
     apply_tree,
     grow_tree,
     predict,
+    reduced_split_basis,
 )
+
+
+def _basis(X: np.ndarray, A: np.ndarray | None = None):
+    """(Z, BBt, ZK) for an unrestricted fit on `X` lifted by `A`."""
+    if A is None:
+        A = np.eye(X.shape[1])
+    lin_cols = np.ones(A.shape[1] + 1, dtype=bool)
+    return reduced_split_basis(jnp.asarray(X), jnp.asarray(A), lin_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +64,14 @@ def test_evaluate_splits_finds_step_in_y():
     rng = np.random.default_rng(0)
     X = rng.uniform(-1.0, 1.0, size=(120, 1))
     y = (X[:, 0] > 0.0).astype(float)[:, None]  # (N, 1)
-    X_aug = jnp.concatenate([jnp.ones((X.shape[0], 1)), jnp.asarray(X)], axis=1)
+    Z, BBt, ZK = _basis(X)
     y_j = jnp.asarray(y)
     mask = jnp.ones(X.shape[0], dtype=jnp.float64)
     X_split = jnp.asarray(X)  # split on the only feature
     thresholds = jnp.asarray(np.linspace(-0.8, 0.8, 9)[:, None])  # (B, K)
 
-    overall, _, _, n_below, n_above = _evaluate_splits(
-        X_aug, y_j, mask, X_split, thresholds, 1e-5, 5.0, "mae"
+    overall, n_below, n_above = _evaluate_splits(
+        Z, ZK, BBt, y_j, mask, X_split, thresholds, 1e-5, 5.0, "mae"
     )
     assert overall.shape == (1, 9)
     best_b = int(jnp.argmin(overall[0]))
@@ -77,12 +86,12 @@ def test_evaluate_splits_invalidates_too_small_sides():
     """Bins violating min_samples_leaf should produce inf overall loss."""
     X = jnp.asarray(np.linspace(0.0, 1.0, 20)[:, None])
     y = jnp.zeros((20, 1))
-    X_aug = jnp.concatenate([jnp.ones((20, 1)), X], axis=1)
+    Z, BBt, ZK = _basis(np.asarray(X))
     mask = jnp.ones(20, dtype=jnp.float64)
     # Threshold near the top will leave ≤ 2 points above.
     thresholds = jnp.asarray([[0.05], [0.95]])  # (B=2, K=1)
-    overall, _, _, _, _ = _evaluate_splits(
-        X_aug, y, mask, X, thresholds, 1e-5, 5.0, "mae"
+    overall, _, _ = _evaluate_splits(
+        Z, ZK, BBt, y, mask, X, thresholds, 1e-5, 5.0, "mae"
     )
     assert jnp.isinf(overall[0, 0]) or jnp.isinf(overall[0, 1])
 

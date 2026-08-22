@@ -20,18 +20,33 @@ from jax_ldt.tree_core import (
     _WEIGHTED_LOSS_FNS,
     _compute_thresholds,
     _evaluate_splits,
+    _fit_one_side,
+    reduced_split_basis,
 )
 
 
-def _recompute(loss_name, X_aug, y, node_mask, X_split, thresholds,
-               theta_b, theta_a):
-    """Return (combined, weighted_avg) node losses per candidate."""
+def _basis(X, A=None):
+    """(Z, BBt, ZK) for an unrestricted fit on `X` lifted by `A`."""
+    if A is None:
+        A = np.eye(np.asarray(X).shape[1])
+    lin_cols = np.ones(np.asarray(A).shape[1] + 1, dtype=bool)
+    return reduced_split_basis(jnp.asarray(X), jnp.asarray(A), lin_cols)
+
+
+def _recompute(loss_name, X_aug, y, node_mask, X_split, thresholds, ridge=1e-5):
+    """Return (combined, weighted_avg) node losses per candidate.
+
+    Reference implementation: fits each side densely in the *full*
+    ``n_aug`` space with :func:`_fit_one_side`, which is what the kernel's
+    reduced-space solve must reproduce.
+    """
     fn = _WEIGHTED_LOSS_FNS[loss_name]
     Xa = np.asarray(X_aug)
+    Xa_j = jnp.asarray(X_aug)
     yj = jnp.asarray(y)
     nm = np.asarray(node_mask)
     thr = np.asarray(thresholds)
-    K, B = theta_b.shape[0], theta_b.shape[1]
+    B, K = thr.shape
     combined = np.full((K, B), np.nan)
     weighted = np.full((K, B), np.nan)
     for c in range(K):
@@ -41,8 +56,10 @@ def _recompute(loss_name, X_aug, y, node_mask, X_split, thresholds,
             ma = (nm * (~below)).astype(float)
             if mb.sum() < 3 or ma.sum() < 3:
                 continue
-            yhb = Xa @ np.asarray(theta_b[c, b])
-            yha = Xa @ np.asarray(theta_a[c, b])
+            theta_b = _fit_one_side(Xa_j, yj, jnp.asarray(mb), ridge)
+            theta_a = _fit_one_side(Xa_j, yj, jnp.asarray(ma), ridge)
+            yhb = Xa @ np.asarray(theta_b)
+            yha = Xa @ np.asarray(theta_a)
             yhc = yhb * mb[:, None] + yha * ma[:, None]
             combined[c, b] = float(
                 np.sum(np.asarray(fn(yj, jnp.asarray(yhc), jnp.asarray(nm))))
@@ -65,15 +82,15 @@ def test_kernel_uses_combined_prediction_loss(loss_name) -> None:
     node_mask = jnp.ones(N)
     X_split = jnp.asarray(X_t)
     thresholds = _compute_thresholds(X_t, max_bins=8)
+    Z, BBt, ZK = _basis(X_t)
 
-    overall, theta_b, theta_a, _, _ = _evaluate_splits(
-        X_aug, jnp.asarray(y), node_mask, X_split, thresholds,
+    overall, _, _ = _evaluate_splits(
+        Z, ZK, BBt, jnp.asarray(y), node_mask, X_split, thresholds,
         1e-5, 3.0, loss_name,
     )
     overall = np.asarray(overall)
     combined, weighted = _recompute(
         loss_name, X_aug, y, node_mask, X_split, thresholds,
-        np.asarray(theta_b), np.asarray(theta_a),
     )
 
     finite = np.isfinite(combined)

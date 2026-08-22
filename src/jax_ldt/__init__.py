@@ -4,6 +4,7 @@ from jax_ldt.linear_tree import LinearTreeRegressor
 from jax_ldt.hyperplane_tree import HyperplaneTreeRegressor
 from jax_ldt.hyperplanes import (
     build_transform_matrix,
+    count_lifted_features,
     generate_planes_to_index,
     lift,
     symmetrize,
@@ -81,6 +82,7 @@ __all__ = [
     "SklearnLinearTreeRegressor",
     "SklearnHyperplaneTreeRegressor",
     "build_transform_matrix",
+    "count_lifted_features",
     "generate_planes_to_index",
     "lift",
     "symmetrize",

@@ -176,6 +176,7 @@ class SklearnHyperplaneTreeRegressor(_SklearnTreeBase):
         do_symmetrize: bool = True,
         do_scaling: bool = True,
         tol_decimals: int = 4,
+        max_hyperplanes: Optional[int] = None,
         hyperplane_weights=None,
     ) -> None:
         self.criterion = criterion
@@ -194,6 +195,7 @@ class SklearnHyperplaneTreeRegressor(_SklearnTreeBase):
         self.do_symmetrize = do_symmetrize
         self.do_scaling = do_scaling
         self.tol_decimals = tol_decimals
+        self.max_hyperplanes = max_hyperplanes
         self.hyperplane_weights = hyperplane_weights
 
     def _make_estimator(self):
@@ -216,5 +218,6 @@ class SklearnHyperplaneTreeRegressor(_SklearnTreeBase):
             do_symmetrize=self.do_symmetrize,
             do_scaling=self.do_scaling,
             tol_decimals=self.tol_decimals,
+            max_hyperplanes=self.max_hyperplanes,
             hyperplane_weights=self.hyperplane_weights,
         )

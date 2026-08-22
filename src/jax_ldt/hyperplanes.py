@@ -12,6 +12,17 @@ fit time and the output is small); the matrix building is plain JAX.
 
 Convention: weight enumeration is deterministic and lex-sorted after
 rounding to `tol_decimals`. This is pinned by `test_principled_choices.py`.
+
+**Size matters.** The lifted-feature count grows combinatorially in
+``num_terms`` and ``max_weight`` (and polynomially in the feature count:
+with the defaults ``num_terms=2, max_weight=1`` it is exactly
+``n_features**2``). Fit cost is linear in that count for split search and
+*cubic* in it for the per-node leaf solve, so an innocuous-looking bump
+of ``num_terms`` can turn a two-second fit into an hour. Use
+:func:`count_lifted_features` to check a configuration before fitting,
+``max_hyperplanes`` to cap it, and expect a :class:`UserWarning` past
+``LIFTED_FEATURE_WARN_THRESHOLD``. See ``docs/benchmarks.md`` ("Cost
+model") for the full scaling statement.
 """
 
 from __future__ import annotations
@@ -23,6 +34,13 @@ from typing import Optional
 
 import jax.numpy as jnp
 import numpy as np
+
+
+# Lifted-feature count past which `build_transform_matrix` warns. Chosen
+# so that a fit stays in the seconds range on a typical CPU: the per-node
+# leaf solve is O(n_lifted**3), so ~1e3 lifted features is where the cubic
+# term starts to dominate everything else.
+LIFTED_FEATURE_WARN_THRESHOLD = 1024
 
 
 def _warn_rounding_collapse(rows: np.ndarray, tol_decimals: int, where: str) -> None:
@@ -151,6 +169,7 @@ def build_transform_matrix(
     do_scaling: bool = True,
     tol_decimals: int = 4,
     categorical_features: Optional[tuple[int, ...]] = None,
+    max_hyperplanes: Optional[int] = None,
 ) -> jnp.ndarray:
     """Build the (n_features_in, n_features_lifted) transformation matrix.
 
@@ -162,8 +181,25 @@ def build_transform_matrix(
     `do_scaling` rescales each LC row by the data range of each feature
     (so hyperplane angles aren't dominated by feature units).
 
+    `max_hyperplanes` caps the number of *oblique* directions kept (the
+    identity block is always retained on top). When the enumeration
+    produces more, an evenly spaced subsequence of the lex-sorted rows is
+    taken — deterministic, and spread across the direction set rather
+    than biased toward one corner of it. ``None`` (the default) keeps
+    every enumerated direction.
+
+    Emits a :class:`UserWarning` when the lifted-feature count exceeds
+    :data:`LIFTED_FEATURE_WARN_THRESHOLD`, since fit cost is cubic in
+    that count for the per-node leaf solve.
+
     Returned matrix shape: (n_in, n_lifted). To lift X: `X @ A`.
     """
+    if max_hyperplanes is not None:
+        max_hyperplanes = int(max_hyperplanes)
+        if max_hyperplanes < 0:
+            raise ValueError(
+                f"max_hyperplanes must be >= 0 or None; got {max_hyperplanes}"
+            )
     X = jnp.asarray(X)
     n_cols = int(X.shape[1])
 
@@ -254,6 +290,39 @@ def build_transform_matrix(
     extra = np.round(extra, decimals=tol_decimals)
     extra = np.unique(extra, axis=0)
 
+    if max_hyperplanes is not None and extra.shape[0] > max_hyperplanes:
+        n_enumerated = int(extra.shape[0])
+        if max_hyperplanes == 0:
+            extra = extra[:0]
+        else:
+            keep_idx = np.linspace(
+                0, n_enumerated - 1, max_hyperplanes, dtype=np.int64
+            )
+            extra = extra[np.unique(keep_idx)]
+        warnings.warn(
+            f"build_transform_matrix: capped the oblique directions at "
+            f"max_hyperplanes={max_hyperplanes} (enumeration produced "
+            f"{n_enumerated}). The kept rows are an evenly spaced "
+            "subsequence of the lex-sorted set, so the fit is deterministic "
+            "but no longer searches every enumerated direction.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    n_lifted = n_cols + int(extra.shape[0])
+    if n_lifted > LIFTED_FEATURE_WARN_THRESHOLD:
+        warnings.warn(
+            f"build_transform_matrix: num_terms={num_terms}, "
+            f"max_weight={max_weight} over {n_non_cat} non-categorical "
+            f"features lifts to {n_lifted} features. Fit cost grows "
+            "linearly in that count for the split search and cubically for "
+            "the per-node leaf solve, so this fit may take minutes to "
+            "hours. Lower num_terms (biggest lever) or max_weight, or set "
+            "max_hyperplanes to cap the direction set.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     if do_scaling:
         ranges = np.asarray(jnp.max(X, axis=0) - jnp.min(X, axis=0), dtype=np.float64)
         ranges = np.where(ranges < 1e-8, 1e-8, ranges)
@@ -268,6 +337,53 @@ def build_transform_matrix(
     full = np.vstack([np.eye(n_cols), extra]).astype(np.float64)
     A = jnp.asarray(full.T, dtype=X.dtype)
     return A
+
+
+@functools.lru_cache(maxsize=128)
+def count_lifted_features(
+    n_features: int,
+    *,
+    num_terms: int = 2,
+    max_weight: int = 1,
+    do_symmetrize: bool = True,
+    tol_decimals: int = 4,
+    categorical_features: Optional[tuple[int, ...]] = None,
+    max_hyperplanes: Optional[int] = None,
+) -> int:
+    """Lifted-feature count for a hyperplane configuration, without fitting.
+
+    Runs the same enumeration :func:`build_transform_matrix` does (the
+    row-scaling step does not change the count, so no data is needed) and
+    returns the width of the resulting transform. Use it to size a
+    problem before committing to a fit:
+
+    >>> count_lifted_features(4)                      # defaults
+    16
+    >>> count_lifted_features(4, num_terms=3, max_weight=2)
+    152
+
+    With the defaults (``num_terms=2, max_weight=1``) the count is
+    exactly ``n_features ** 2``. Raising ``num_terms`` is by far the
+    biggest lever; see ``docs/benchmarks.md`` for the cost model.
+
+    Results are cached, and the size warnings
+    :func:`build_transform_matrix` would emit are suppressed — counting a
+    configuration is exactly how you avoid triggering them.
+    """
+    dummy = jnp.zeros((2, int(n_features)), dtype=jnp.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        A = build_transform_matrix(
+            dummy,
+            num_terms=num_terms,
+            max_weight=max_weight,
+            do_symmetrize=do_symmetrize,
+            do_scaling=False,
+            tol_decimals=tol_decimals,
+            categorical_features=categorical_features,
+            max_hyperplanes=max_hyperplanes,
+        )
+    return int(A.shape[1])
 
 
 def lift(X: jnp.ndarray, A: jnp.ndarray) -> jnp.ndarray:

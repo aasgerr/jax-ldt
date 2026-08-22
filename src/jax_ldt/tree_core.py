@@ -12,17 +12,42 @@ Design notes:
    each subdomain are computed eagerly outside the JIT (since the active
    row count is variable).
 
-3. For each candidate split (col, bin), we fit two ridge regressions
+3. For each candidate split (col, bin), we evaluate two ridge regressions
    (left and right side) using the mask × side-mask as a 0/1
    sample-weight. This is mathematically equivalent to row-selection
-   followed by ordinary ridge — but the shape stays (N, n_aug) so vmap
-   covers all K*B candidates at once.
+   followed by ordinary ridge, and vmap covers all K*B candidates at
+   once.
 
-4. The fit uses normal-equations + `jax.scipy.linalg.solve(..., 'pos')`.
-   Ridge is added to XᵀWX BEFORE the solve. Ridge guarantees positive
-   definiteness even when w is sparse / nearly all-zero, so invalid
-   candidates produce some theta which we then discard via a validity
-   mask. See `test_principled_choices.py`.
+4. The fit uses normal-equations + `jax.scipy.linalg.solve`. Ridge is
+   added to XᵀWX BEFORE the solve. Ridge guarantees invertibility even
+   when w is sparse / nearly all-zero, so invalid candidates produce some
+   theta which we then discard via a validity mask. See
+   `test_principled_choices.py`.
+
+5. **Reduced-space candidate evaluation.** The fitting design matrix is
+   always ``X_fit = Z @ B`` where ``Z = [1, X]`` has ``m = n_features_in
+   + 1`` columns and ``B`` is the (bias-augmented, ``linear_features``-
+   masked) transform matrix. Every lifted column is therefore a linear
+   function of the *original* features, so the ``n_aug``-dimensional
+   ridge fit has at most ``m`` degrees of freedom. Using the push-through
+   identity
+
+       (Bᵀ G B + λI)⁻¹ Bᵀ v  =  Bᵀ (G BBᵀ + λI)⁻¹ v
+
+   with ``G = ZᵀWZ`` and ``v = ZᵀWy`` (both ``m``-sized), the per-
+   candidate solve drops from ``O(n_aug³)`` to ``O(N·m² + m³)`` and the
+   fitted values follow as ``ŷ = (Z·BBᵀ)·u``. This is an algebraic
+   identity, not an approximation: the candidate losses agree with the
+   dense fit to round-off (~1e-15 relative). It is what keeps hyperplane
+   fit cost *linear* in the lifted-feature count instead of quartic —
+   see `docs/benchmarks.md` ("Cost model") and issue #2.
+
+6. **Bounded working set.** Candidates are evaluated in column chunks
+   sized so the kernel's peak intermediate allocation stays under
+   ``SPLIT_MEMORY_BUDGET_BYTES``. The chunk width is a compile-time
+   constant for a given ``grow_tree`` call, so the kernel still traces
+   once; the last chunk is padded (with ``+inf`` thresholds, which score
+   as invalid) rather than reshaped, to avoid a second compilation.
 """
 
 from __future__ import annotations
@@ -142,8 +167,84 @@ def _weighted_loss(name: str):
     return _WEIGHTED_LOSS_FNS[name]
 
 
+def _reduced_yhat_one(
+    Z: jnp.ndarray,  # (N, m)   = [1, X_raw]
+    ZK: jnp.ndarray,  # (N, m)   = Z @ (B Bᵀ)
+    BBt: jnp.ndarray,  # (m, m)  = B Bᵀ
+    y: jnp.ndarray,  # (N, T)
+    w: jnp.ndarray,  # (N,)
+    ridge: float,
+) -> jnp.ndarray:
+    """Fitted values of one weighted ridge fit, computed in reduced space.
+
+    Equivalent to ``X_fit @ _fit_one_side(X_fit, y, w, ridge)`` for
+    ``X_fit = Z @ B``, but costs ``O(N·m² + m³)`` instead of
+    ``O(N·n_aug² + n_aug³)``. See design note 5 in the module docstring
+    for the identity. Returns ``(N, T)``.
+    """
+    Zw = Z * w[:, None]
+    G = Zw.T @ Z  # (m, m)
+    v = Zw.T @ y  # (m, T)
+    eye = jnp.eye(BBt.shape[0], dtype=BBt.dtype)
+    u = jsl.solve(G @ BBt + ridge * eye, v)  # (m, T)
+    return ZK @ u
+
+
+_reduced_yhat_many = jax.vmap(
+    _reduced_yhat_one, in_axes=(None, None, None, None, 0, None)
+)
+
+
+def reduced_split_basis(
+    X: jnp.ndarray,
+    transform_matrix: jnp.ndarray,
+    lin_cols: np.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Factor the fitting design matrix as ``X_fit = Z @ B``.
+
+    ``X_fit`` is ``add_bias(X @ transform_matrix)`` with the columns
+    outside ``lin_cols`` zeroed. Because ``add_bias(X @ A) == [1, X] @
+    blockdiag(1, A)`` and the mask zeroes whole columns of that product,
+    the factorisation is exact with ``Z = [1, X]`` of width
+    ``m = n_features_in + 1``.
+
+    Parameters
+    ----------
+    X : (N, n_features_in)
+        Raw (untransformed) inputs.
+    transform_matrix : (n_features_in, n_features_transformed)
+        The hyperplane lift; pass the identity for an axis-aligned tree.
+    lin_cols : (n_aug,) bool
+        Which augmented columns take part in the fit (index 0 is bias).
+
+    Returns
+    -------
+    Z : (N, m)      — ``[1, X]``
+    BBt : (m, m)    — ``B Bᵀ``
+    ZK : (N, m)     — ``Z @ B Bᵀ``, precomputed for the fitted values
+    """
+    X = jnp.asarray(X)
+    n_in = int(X.shape[1])
+    A = np.asarray(transform_matrix, dtype=np.float64)
+    n_aug = A.shape[1] + 1
+    lin_cols = np.asarray(lin_cols, dtype=bool)
+    if lin_cols.shape != (n_aug,):
+        raise ValueError(
+            f"lin_cols must have shape ({n_aug},); got {tuple(lin_cols.shape)}"
+        )
+    B_full = np.zeros((n_in + 1, n_aug), dtype=np.float64)
+    B_full[0, 0] = 1.0
+    B_full[1:, 1:] = A
+    B_masked = B_full * lin_cols[None, :]
+    BBt = jnp.asarray(B_masked @ B_masked.T, dtype=X.dtype)
+    Z = add_bias(X)
+    return Z, BBt, Z @ BBt
+
+
 def _evaluate_splits_kernel(
-    X_aug: jnp.ndarray,  # (N, n_aug)
+    Z: jnp.ndarray,  # (N, m)   raw bias-augmented inputs
+    ZK: jnp.ndarray,  # (N, m)  Z @ (B Bᵀ)
+    BBt: jnp.ndarray,  # (m, m) B Bᵀ
     y: jnp.ndarray,  # (N, T)
     node_mask: jnp.ndarray,  # (N,) float — 1 for in-subdomain
     X_split: jnp.ndarray,  # (N, K)
@@ -151,20 +252,25 @@ def _evaluate_splits_kernel(
     ridge: float,
     min_samples_leaf: float,
     loss_name: str,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Evaluate K*B candidate splits in parallel.
 
     Returns
     -------
     overall : (K, B) per-candidate combined loss (inf for invalid)
-    theta_below : (K, B, n_aug, T)
-    theta_above : (K, B, n_aug, T)
     n_below : (K, B) sample counts on the left
     n_above : (K, B) sample counts on the right
+
+    The per-candidate leaf parameters are deliberately *not* returned:
+    only the argmin candidate's children are ever needed, and they are
+    refit host-side with :func:`_fit_one_side` (the same code path as
+    leaf fits, so child/leaf parameters stay bit-identical). Materialising
+    ``(K, B, n_aug, T)`` for every candidate was both the memory and the
+    compile-time bottleneck on lifted feature spaces.
     """
     K = X_split.shape[1]
     B = thresholds.shape[0]
-    N = X_aug.shape[0]
+    N = Z.shape[0]
 
     # threshold_mask[c, b, s] = X_split[s, c] <= thresholds[b, c]
     # rearrange to (K, B, N)
@@ -183,13 +289,10 @@ def _evaluate_splits_kernel(
     mb_flat = mb.reshape(K * B, N)
     ma_flat = ma.reshape(K * B, N)
 
-    theta_below_flat = _fit_many_sides(X_aug, y, mb_flat, ridge)  # (K*B, n_aug, T)
-    theta_above_flat = _fit_many_sides(X_aug, y, ma_flat, ridge)
-
-    # Predict for all N rows under each candidate
-    # X_aug @ theta gives (N, T); for K*B candidates we einsum
-    yh_below = jnp.einsum("nf,ift->int", X_aug, theta_below_flat)  # (K*B, N, T)
-    yh_above = jnp.einsum("nf,ift->int", X_aug, theta_above_flat)
+    # Fitted values for each side of each candidate, computed in the
+    # m-dimensional reduced space (design note 5).
+    yh_below = _reduced_yhat_many(Z, ZK, BBt, y, mb_flat, ridge)  # (K*B, N, T)
+    yh_above = _reduced_yhat_many(Z, ZK, BBt, y, ma_flat, ridge)
 
     weighted_loss = _weighted_loss(loss_name)
     # Evaluate the loss of the *combined* piecewise prediction over the
@@ -204,32 +307,105 @@ def _evaluate_splits_kernel(
     overall_flat = jnp.where(valid.reshape(K * B), overall_flat, jnp.inf)
     overall_flat = jnp.nan_to_num(overall_flat, nan=jnp.inf, posinf=jnp.inf)
 
-    return (
-        overall_flat.reshape(K, B),
-        theta_below_flat.reshape(K, B, X_aug.shape[1], y.shape[1]),
-        theta_above_flat.reshape(K, B, X_aug.shape[1], y.shape[1]),
-        n_below,
-        n_above,
-    )
+    return overall_flat.reshape(K, B), n_below, n_above
 
 
 # JIT-compile the kernel; static_argnames avoids retracing on hyperparams.
 #
 # Shape invariants (compile-once requires these to be stable across nodes):
-# - X_aug.shape  == (N, n_aug)         — full dataset, augmented bias column
-# - y.shape      == (N, T)
+# - Z.shape   == (N, m)                — m = n_features_in + 1
+# - ZK.shape  == (N, m)
+# - BBt.shape == (m, m)
+# - y.shape   == (N, T)
 # - node_mask.shape == (N,)
-# - X_split.shape   == (N, K)          — K = len(split_features), set at fit time
+# - X_split.shape   == (N, K)          — K = chunk width, fixed at fit time
 # - thresholds.shape == (B, K)         — B = max_bins - 1, set at fit time
 # - ridge, min_samples_leaf are scalars; loss_name is a static string
-# `K`, `B`, `N`, `n_aug`, `T` are all fixed for the duration of a single
-# `grow_tree` call, so this kernel JIT-traces once per fit. If a future
-# refactor makes split_features per-node-dynamic, retracing will fire on
-# every node — guard the dynamic case explicitly there.
+# `K`, `B`, `N`, `m`, `T` are all fixed for the duration of a single
+# `grow_tree` call, so this kernel JIT-traces once per fit (the last
+# column chunk is padded to the same width rather than reshaped). If a
+# future refactor makes split_features per-node-dynamic, retracing will
+# fire on every node — guard the dynamic case explicitly there.
 _evaluate_splits = jax.jit(
     _evaluate_splits_kernel,
     static_argnames=("loss_name",),
 )
+
+
+# Peak-intermediate budget for one call to `_evaluate_splits`. The split
+# columns are processed in chunks narrow enough to stay under this, so a
+# large lifted feature space costs more *calls*, not more memory. Raise
+# it to trade memory for fewer kernel launches.
+SPLIT_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+def _candidate_chunk_cols(
+    n_split_cols: int, n_bins: int, n_rows: int, n_targets: int, m: int
+) -> int:
+    """How many split columns fit in one kernel call under the budget.
+
+    The kernel's dominant intermediates are ``O(C·N)`` side masks and
+    fitted values (``C = cols·bins`` candidates) plus ``O(C·m²)`` Gram
+    matrices. Solve for the largest ``cols`` whose working set fits, then
+    clamp to ``[1, n_split_cols]``.
+    """
+    if n_bins <= 0:
+        return max(1, n_split_cols)
+    # bytes per candidate: masks (2), fitted values (3), plus Gram/rhs.
+    per_candidate = 8 * (5 * n_rows * max(n_targets, 1) + m * m + 2 * m * n_targets)
+    per_col = max(1, per_candidate * n_bins)
+    cols = int(SPLIT_MEMORY_BUDGET_BYTES // per_col)
+    return max(1, min(n_split_cols, cols))
+
+
+def _evaluate_splits_chunked(
+    Z: jnp.ndarray,
+    ZK: jnp.ndarray,
+    BBt: jnp.ndarray,
+    y: jnp.ndarray,
+    node_mask: jnp.ndarray,
+    X_split: jnp.ndarray,
+    thresholds: jnp.ndarray,
+    ridge: float,
+    min_samples_leaf: float,
+    loss_name: str,
+    chunk_cols: int,
+) -> np.ndarray:
+    """`_evaluate_splits` over column chunks; returns the (K, B) losses.
+
+    Chunks are always ``chunk_cols`` wide — the tail is padded with
+    ``+inf`` thresholds (every row lands below, so the right child is
+    empty and the candidate scores ``inf``) and sliced off afterwards.
+    Fixed width means one traced shape per fit, not one per chunk size.
+    """
+    K = int(X_split.shape[1])
+    B = int(thresholds.shape[0])
+    if chunk_cols >= K:
+        overall, _, _ = _evaluate_splits(
+            Z, ZK, BBt, y, node_mask, X_split, thresholds,
+            ridge, min_samples_leaf, loss_name,
+        )
+        return np.asarray(overall)
+
+    blocks: list[np.ndarray] = []
+    for start in range(0, K, chunk_cols):
+        stop = min(start + chunk_cols, K)
+        xs = X_split[:, start:stop]
+        th = thresholds[:, start:stop]
+        pad = chunk_cols - (stop - start)
+        if pad:
+            xs = jnp.concatenate(
+                [xs, jnp.zeros((xs.shape[0], pad), dtype=xs.dtype)], axis=1
+            )
+            th = jnp.concatenate(
+                [th, jnp.full((B, pad), jnp.inf, dtype=th.dtype)], axis=1
+            )
+        overall, _, _ = _evaluate_splits(
+            Z, ZK, BBt, y, node_mask, xs, th,
+            ridge, min_samples_leaf, loss_name,
+        )
+        blocks.append(np.asarray(overall)[: stop - start])
+    return np.concatenate(blocks, axis=0)
 
 
 # Leaf-fit alias. Kept as the *eager* `_fit_one_side` rather than a
@@ -404,6 +580,10 @@ def grow_tree(
         lin_cols[int(f) + 1] = True
     X_fit = X_aug * jnp.asarray(lin_cols, dtype=X_aug.dtype)[None, :]
 
+    # Reduced basis for candidate-split evaluation (design note 5).
+    m_reduced = n_in + 1
+    Z_raw, BBt, ZK = reduced_split_basis(X, transform_matrix, lin_cols)
+
     # Resolve min_samples_leaf to absolute integer.
     if isinstance(min_samples_leaf, float) and 0.0 < min_samples_leaf < 1.0:
         msl = max(3, int(jnp.ceil(min_samples_leaf * N)))
@@ -434,7 +614,6 @@ def grow_tree(
 
     # --- root node ---
     root_mask = jnp.ones(N, dtype=X_aug.dtype)
-    root_params, root_loss = _initial_leaf(X_fit, y, root_mask, ridge, criterion)
 
     # node bookkeeping
     nodes: list[_GrowNode] = []
@@ -455,19 +634,30 @@ def grow_tree(
         """
         return _leaf_stats_kernel(mask, X_t, X_aug, y, params)
 
-    def _finalize_leaf(node_id: int, mask: jnp.ndarray, params: jnp.ndarray) -> None:
+    def _finalize_leaf(node_id: int, mask: jnp.ndarray) -> None:
         """Mark an existing placeholder node as a leaf and populate its
-        UQ stats. Used by every early-exit path in the growth loop."""
-        x_mean, x_var, n_leaf, mse = _leaf_stats(mask, params)
+        UQ stats. Used by every early-exit path in the growth loop.
+
+        The node's regression was already fitted when the node was
+        created (`_add_node`), so no refit happens here — a node's
+        parameters are solved exactly once, whether it ends up a leaf or
+        an internal node.
+        """
         nd = nodes[node_id]
+        x_mean, x_var, n_leaf, mse = _leaf_stats(mask, nd.leaf_params)
         nd.is_leaf = True
-        nd.leaf_params = params
         nd.leaf_x_mean = x_mean
         nd.leaf_x_var = x_var
         nd.leaf_n = n_leaf
         nd.leaf_mse = mse
 
-    def _placeholder_split(mask: jnp.ndarray) -> int:
+    def _add_node(mask: jnp.ndarray) -> int:
+        """Fit the node's regression, register it, and record its loss.
+
+        Returns the new node id. The node starts as a non-leaf
+        placeholder; `_finalize_leaf` promotes it if growth stops here.
+        """
+        params, loss = _initial_leaf(X_fit, y, mask, ridge, criterion)
         nid = len(nodes)
         nodes.append(
             _GrowNode(
@@ -477,7 +667,7 @@ def grow_tree(
                 threshold=float("nan"),
                 left=-1,
                 right=-1,
-                leaf_params=jnp.zeros((n_aug, T), dtype=X_aug.dtype),
+                leaf_params=params,
                 leaf_x_mean=jnp.zeros((n_transformed,), dtype=X_aug.dtype),
                 leaf_x_var=jnp.zeros((n_transformed,), dtype=X_aug.dtype),
                 leaf_n=0,
@@ -485,17 +675,23 @@ def grow_tree(
             )
         )
         node_masks.append(mask)
+        node_loss.append(float(loss))
         return nid
 
     # --- queue: list of (node_id, depth) ---
-    root_id = _placeholder_split(root_mask)
-    node_loss.append(float(root_loss))
+    root_id = _add_node(root_mask)
     queue: list[tuple[int, int]] = [(root_id, 0)]
 
     split_feats_arr = jnp.asarray(split_features, dtype=jnp.int32)
     # Loop-invariant: the split-feature columns of X_t are the same for
     # every node (only the mask varies), so gather them once.
     X_split = X_t[:, split_feats_arr]
+
+    # Column-chunk width for the candidate kernel. Fixed for the whole
+    # call so the kernel traces once; see `_candidate_chunk_cols`.
+    chunk_cols = _candidate_chunk_cols(
+        int(X_split.shape[1]), max(max_bins - 1, 1), N, T, m_reduced
+    )
 
     # Numpy mirror of `X_t` used for all host-side mask arithmetic.
     # Computed once per `grow_tree` call. The JIT'd split kernel still
@@ -517,8 +713,7 @@ def grow_tree(
             or n_active < mss
             or n_active < 2 * msl
         ):
-            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
-            _finalize_leaf(node_id, mask, params)
+            _finalize_leaf(node_id, mask)
             continue
 
         # Compute thresholds on the active subdomain via numpy (avoids
@@ -528,12 +723,15 @@ def grow_tree(
         X_split_subdomain = X_t_np[np.ix_(active_idx, split_features)]
         thresholds = _compute_thresholds(X_split_subdomain, max_bins)
         if thresholds.shape[0] == 0:
-            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
-            _finalize_leaf(node_id, mask, params)
+            _finalize_leaf(node_id, mask)
             continue
 
-        overall, theta_b, theta_a, n_below, n_above = _evaluate_splits(
-            X_fit,
+        # Candidate losses come back on the host already (the kernel is
+        # called once per column chunk); all selection happens on numpy.
+        overall_np = _evaluate_splits_chunked(
+            Z_raw,
+            ZK,
+            BBt,
             y,
             mask,
             X_split,
@@ -541,15 +739,10 @@ def grow_tree(
             float(ridge),
             float(msl),
             criterion,
+            chunk_cols,
         )
-
-        # Pull the kernel outputs to host once and do all selection on
-        # numpy. Reading individual scalars from a JAX array would
-        # trigger a separate transfer per access.
-        overall_np = np.asarray(overall)
         if not np.isfinite(overall_np).any():
-            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
-            _finalize_leaf(node_id, mask, params)
+            _finalize_leaf(node_id, mask)
             continue
 
         flat_idx = int(np.argmin(overall_np))
@@ -562,8 +755,7 @@ def grow_tree(
         # non-negative improvement is accepted"; positive values prune.
         impurity_decrease = node_loss[node_id] - best_loss
         if impurity_decrease < min_impurity_decrease:
-            params, _ = _initial_leaf(X_fit, y, mask, ridge, criterion)
-            _finalize_leaf(node_id, mask, params)
+            _finalize_leaf(node_id, mask)
             continue
 
         split_feature_in_transformed_space = int(split_features[c_idx])
@@ -577,17 +769,13 @@ def grow_tree(
         mask_below = jnp.asarray(mask_below_np)
         mask_above = jnp.asarray(mask_above_np)
 
-        # Reserve child nodes. Track child loss under the *same* criterion
-        # used for split selection so min_impurity_decrease comparisons
-        # on grandchildren are consistent.
-        left_id = _placeholder_split(mask_below)
-        node_loss.append(
-            float(_weighted_loss_python(criterion, y, X_aug @ theta_b[c_idx, b_idx], mask_below))
-        )
-        right_id = _placeholder_split(mask_above)
-        node_loss.append(
-            float(_weighted_loss_python(criterion, y, X_aug @ theta_a[c_idx, b_idx], mask_above))
-        )
+        # Create the child nodes. `_add_node` fits each child's
+        # regression and records its loss under the *same* criterion used
+        # for split selection, so min_impurity_decrease comparisons on
+        # grandchildren are consistent — and the fit is reused verbatim
+        # if the child ends up a leaf.
+        left_id = _add_node(mask_below)
+        right_id = _add_node(mask_above)
 
         nodes[node_id].is_leaf = False
         nodes[node_id].feature = split_feature_in_transformed_space
@@ -632,24 +820,6 @@ def grow_tree(
         linear_features=tuple(linear_features),
         categorical_features=tuple(categorical_features),
     )
-
-
-def _weighted_loss_python(
-    name: str, y: jnp.ndarray, yh: jnp.ndarray, w: jnp.ndarray
-) -> float:
-    """Evaluate a weighted loss under the chosen criterion.
-
-    Used for tracking child-node loss for ``min_impurity_decrease``;
-    must agree with the criterion driving the split-selection kernel.
-    Returns inf for an empty subdomain so a downstream "improvement"
-    check rejects it.
-    """
-    sw = float(jnp.sum(w))
-    if sw <= 0.0:
-        return float("inf")
-    fn = _WEIGHTED_LOSS_FNS[name]
-    out = fn(y, yh, w)
-    return float(jnp.sum(out))
 
 
 # --------------------------------------------------------------------------
