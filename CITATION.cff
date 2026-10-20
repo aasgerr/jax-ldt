@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "jax-ldt"
+type: software
+authors:
+  - family-names: Kitchin
+    given-names: John R.
+    orcid: "https://orcid.org/0000-0003-2625-9232"
+    affiliation: Carnegie Mellon University
+repository-code: "https://github.com/jkitchin/jax-ldt"
+version: "0.0.1"
+date-released: "2026-10-20"
+license: MIT
+abstract: "Pure-JAX linear and hyperplane decision trees for piecewise-linear surrogate modeling."
+keywords: [JAX, decision trees, surrogate models]
