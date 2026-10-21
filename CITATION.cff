@@ -11,5 +11,6 @@ repository-code: "https://github.com/jkitchin/jax-ldt"
 version: "0.0.1"
 date-released: "2026-10-20"
 license: MIT
+doi: "10.5281/zenodo.23539946"
 abstract: "Pure-JAX linear and hyperplane decision trees for piecewise-linear surrogate modeling."
 keywords: [JAX, decision trees, surrogate models]

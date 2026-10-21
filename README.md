@@ -3,6 +3,7 @@
 ![jax-ldt logo](jax-ldt.png)
 
 [![CI](https://github.com/jkitchin/jax-ldt/actions/workflows/ci.yml/badge.svg)](https://github.com/jkitchin/jax-ldt/actions/workflows/ci.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23539946.svg)](https://doi.org/10.5281/zenodo.23539946)
 
 
 
